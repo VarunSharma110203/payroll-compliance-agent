@@ -4,7 +4,11 @@ import google.generativeai as genai
 import os
 import time
 import urllib.parse
-import re
+import urllib3
+
+# --- 0. SUPPRESS SSL WARNINGS ---
+# Government websites often have bad certificates. We ignore them to prevent crashes.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- 1. CONFIGURATION ---
 try:
@@ -16,56 +20,144 @@ except KeyError:
     exit(1)
 
 genai.configure(api_key=GENAI_API_KEY)
+# Using 'gemini-pro' because it is stable and reliable for this task
 model = genai.GenerativeModel('gemini-pro')
 
-# --- 2. THE MASTER COMPLIANCE LIST (BASED ON YOUR RESEARCH) ---
+# --- 2. THE MASTER COMPLIANCE LIST (9 COUNTRIES) ---
+# Includes Broad Keywords to catch "concepts" not just exact words.
+
 TARGETS = [
     # === 🇮🇳 INDIA (The Big 5) ===
-    {"c": "India", "auth": "Income Tax (CBDT)", "url": "https://incometaxindia.gov.in/pages/communications/circulars.aspx", "base": "https://incometaxindia.gov.in", "kw": ["tds", "salary", "section 192", "exemption", "form 16"]},
-    {"c": "India", "auth": "Income Tax (Notifications)", "url": "https://incometaxindia.gov.in/pages/communications/notifications.aspx", "base": "https://incometaxindia.gov.in", "kw": ["statutory order", "amendment", "cost inflation"]},
-    {"c": "India", "auth": "EPFO (Provident Fund)", "url": "https://www.epfindia.gov.in/site_en/Circulars.php", "base": "https://www.epfindia.gov.in", "kw": ["interest rate", "wage ceiling", "contribution", "aadhaar"]},
-    {"c": "India", "auth": "PFRDA (NPS)", "url": "https://www.pfrda.org.in/index1.cshtml?lsid=167", "base": "https://www.pfrda.org.in", "kw": ["corporate", "tier", "withdrawal", "kyc"]},
-    {"c": "India", "auth": "Ministry of Labour", "url": "https://labour.gov.in/circulars", "base": "https://labour.gov.in", "kw": ["minimum wage", "bonus", "gratuity", "maternity", "vda"]},
-    {"c": "India", "auth": "ESIC (Insurance)", "url": "https://www.esic.gov.in/circulars", "base": "https://www.esic.gov.in", "kw": ["contribution rate", "wage ceiling", "medical benefit"]},
+    {
+        "c": "India", "auth": "Income Tax (CBDT)", 
+        "url": "https://incometaxindia.gov.in/pages/communications/circulars.aspx", 
+        "base": "https://incometaxindia.gov.in", 
+        "kw": ["tds", "salary", "192", "form 16", "exemption", "rebate", "surcharge", "cess", "80c", "80d", "hra", "lta", "perquisite", "relief", "pan", "tan", "deduction", "income", "finance act"]
+    },
+    {
+        "c": "India", "auth": "Income Tax (Notifications)", 
+        "url": "https://incometaxindia.gov.in/pages/communications/notifications.aspx", 
+        "base": "https://incometaxindia.gov.in", 
+        "kw": ["amendment", "rule", "statutory order", "s.o.", "notification", "cost inflation", "index", "valuation", "taxability"]
+    },
+    {
+        "c": "India", "auth": "EPFO (Provident Fund)", 
+        "url": "https://www.epfindia.gov.in/site_en/Circulars.php", 
+        "base": "https://www.epfindia.gov.in", 
+        "kw": ["interest", "rate", "wage", "ceiling", "contribution", "aadhaar", "uan", "kyc", "damages", "penalty", "edli", "eps", "pension", "digital", "claim"]
+    },
+    {
+        "c": "India", "auth": "Ministry of Labour", 
+        "url": "https://labour.gov.in/circulars", 
+        "base": "https://labour.gov.in", 
+        "kw": ["minimum wage", "vda", "dearness", "allowance", "bonus", "gratuity", "maternity", "leave", "encashment", "overtime", "shift", "standing order", "code on wages", "osh"]
+    },
+    {
+        "c": "India", "auth": "ESIC", 
+        "url": "https://www.esic.gov.in/circulars", 
+        "base": "https://www.esic.gov.in", 
+        "kw": ["contribution", "rate", "threshold", "limit", "medical", "benefit", "sickness", "disablement", "challan", "abry", "scheme"]
+    },
 
     # === 🇦🇪 UAE (Emiratisation & Tax) ===
-    {"c": "UAE", "auth": "MOHRE (Labour)", "url": "https://www.mohre.gov.ae/en/laws-and-regulations/resolutions-and-circulars.aspx", "base": "https://www.mohre.gov.ae", "kw": ["emiratisation", "wps", "work permit", "fine", "quota"]},
-    {"c": "UAE", "auth": "FTA (Tax)", "url": "https://tax.gov.ae/en/taxes/Vat.aspx", "base": "https://tax.gov.ae", "kw": ["corporate tax", "employment income", "registration threshold"]},
-    {"c": "UAE", "auth": "GPSSA (Pension)", "url": "https://gpssa.gov.ae/pages/en/laws-and-regulations", "base": "https://gpssa.gov.ae", "kw": ["contribution rate", "pension cap", "decree-law 57"]},
+    {
+        "c": "UAE", "auth": "MOHRE (Labour)", 
+        "url": "https://www.mohre.gov.ae/en/laws-and-regulations/resolutions-and-circulars.aspx", 
+        "base": "https://www.mohre.gov.ae", 
+        "kw": ["emiratisation", "nafis", "quota", "target", "fine", "penalty", "wps", "wage protection", "work permit", "contract", "gratuity", "end of service", "unemployment", "insurance", "iloel"]
+    },
+    {
+        "c": "UAE", "auth": "FTA (Tax)", 
+        "url": "https://tax.gov.ae/en/taxes/Vat.aspx", 
+        "base": "https://tax.gov.ae", 
+        "kw": ["corporate tax", "employment", "income", "salary", "director", "remuneration", "withholding", "exempt", "threshold", "registration", "deadline"]
+    },
 
-    # === 🇳🇬 NIGERIA (The Federal Suite) ===
-    {"c": "Nigeria", "auth": "FIRS (Tax)", "url": "https://www.firs.gov.ng/press-release/", "base": "https://www.firs.gov.ng", "kw": ["public notice", "wht", "paye", "tax clearance", "relief"]},
-    {"c": "Nigeria", "auth": "PenCom (Pension)", "url": "https://www.pencom.gov.ng/category/regulations-guidelines-circulars-frameworks/circulars/", "base": "https://www.pencom.gov.ng", "kw": ["voluntary contribution", "rsa", "investment", "recapture"]},
-    {"c": "Nigeria", "auth": "NHIA (Health)", "url": "https://www.nhia.gov.ng/operational-guideline/", "base": "https://www.nhia.gov.ng", "kw": ["operational guideline", "gifship", "mandatory", "capitation"]},
-    {"c": "Nigeria", "auth": "ITF (Training)", "url": "http://www.itf.gov.ng/", "base": "http://www.itf.gov.ng/", "kw": ["training contribution", "reimbursement", "compliance certificate"]},
+    # === 🇳🇬 NIGERIA (Federal & Pension) ===
+    {
+        "c": "Nigeria", "auth": "FIRS (Tax)", 
+        "url": "https://www.firs.gov.ng/press-release/", 
+        "base": "https://www.firs.gov.ng", 
+        "kw": ["paye", "wht", "withholding", "relief", "personal income", "pita", "finance act", "deadline", "return", "tax clearance", "tcc", "penalty", "waiver", "interest"]
+    },
+    {
+        "c": "Nigeria", "auth": "PenCom", 
+        "url": "https://www.pencom.gov.ng/category/regulations-guidelines-circulars-frameworks/circulars/", 
+        "base": "https://www.pencom.gov.ng", 
+        "kw": ["pension", "contribution", "rate", "employer", "employee", "voluntary", "rsa", "recapture", "pfa", "compliance", "certificate"]
+    },
 
-    # === 🇵🇭 PHILIPPINES (The Statutory 4) ===
-    {"c": "Philippines", "auth": "BIR (Tax)", "url": "https://www.bir.gov.ph/index.php/revenue-issuances/revenue-memorandum-circulars.html", "base": "https://www.bir.gov.ph", "kw": ["withholding tax", "alphalist", "bonus", "tax table", "orus"]},
-    {"c": "Philippines", "auth": "SSS (Social Security)", "url": "https://www.sss.gov.ph/sss-circulars/", "base": "https://www.sss.gov.ph", "kw": ["contribution schedule", "msp", "wisp", "acop"]},
-    {"c": "Philippines", "auth": "PhilHealth", "url": "https://www.philhealth.gov.ph/circulars/", "base": "https://www.philhealth.gov.ph", "kw": ["premium rate", "income ceiling", "uhc"]},
-    {"c": "Philippines", "auth": "Pag-IBIG (Housing)", "url": "https://www.pagibigfundservices.com/", "base": "https://www.pagibigfundservices.com", "kw": ["membership savings", "mp2", "calamity loan"]},
+    # === 🇵🇭 PHILIPPINES (Statutory) ===
+    {
+        "c": "Philippines", "auth": "BIR (Tax)", 
+        "url": "https://www.bir.gov.ph/index.php/revenue-issuances/revenue-memorandum-circulars.html", 
+        "base": "https://www.bir.gov.ph", 
+        "kw": ["withholding", "tax", "compensation", "1601-c", "alphalist", "2316", "13th month", "bonus", "de minimis", "exemption", "table", "rate", "orus"]
+    },
+    {
+        "c": "Philippines", "auth": "PhilHealth", 
+        "url": "https://www.philhealth.gov.ph/circulars/", 
+        "base": "https://www.philhealth.gov.ph", 
+        "kw": ["premium", "rate", "contribution", "increase", "table", "income", "ceiling", "floor", "uhc", "universal"]
+    },
+    {
+        "c": "Philippines", "auth": "SSS & Pag-IBIG", 
+        "url": "https://www.sss.gov.ph/sss-circulars/", 
+        "base": "https://www.sss.gov.ph", 
+        "kw": ["contribution", "schedule", "msp", "wisp", "provident", "fund", "housing", "savings", "loan", "condonation", "penalty"]
+    },
+
+    # === 🇰🇪 KENYA (Levies) ===
+    {
+        "c": "Kenya", "auth": "KRA & NSSF", 
+        "url": "https://www.kra.go.ke/news-center/public-notices", 
+        "base": "https://www.kra.go.ke", 
+        "kw": ["housing levy", "ahl", "relief", "insurance", "paye", "tax", "resident", "nssf", "tier", "earnings", "limit", "rate", "shif", "sha", "health"]
+    },
 
     # === 🇿🇼 ZIMBABWE (Multi-Currency) ===
-    {"c": "Zimbabwe", "auth": "ZIMRA (Tax)", "url": "https://www.zimra.co.zw/public-notices", "base": "https://www.zimra.co.zw", "kw": ["paye", "tax tables", "currency", "zig", "qpd"]},
-    {"c": "Zimbabwe", "auth": "NSSA (Social Security)", "url": "https://www.nssa.org.zw/document-library/", "base": "https://www.nssa.org.zw", "kw": ["insurable earnings", "ceiling", "pobs", "self-service"]},
+    {
+        "c": "Zimbabwe", "auth": "ZIMRA", 
+        "url": "https://www.zimra.co.zw/public-notices", 
+        "base": "https://www.zimra.co.zw", 
+        "kw": ["paye", "tax table", "currency", "usd", "zig", "rate", "threshold", "exempt", "bonus", "nssa", "insurable", "pobs", "apwcs"]
+    },
 
-    # === 🇰🇪 KENYA (The New Levies) ===
-    {"c": "Kenya", "auth": "KRA (Tax)", "url": "https://www.kra.go.ke/news-center/public-notices", "base": "https://www.kra.go.ke", "kw": ["housing levy", "fringe benefit", "etims", "paye return"]},
-    {"c": "Kenya", "auth": "NSSF (Social Security)", "url": "https://www.nssf.or.ke/public-notice", "base": "https://www.nssf.or.ke", "kw": ["tier i", "tier ii", "earnings limit", "act 2013"]},
-    {"c": "Kenya", "auth": "SHA (Health)", "url": "https://sha.go.ke/resources/terms-conditions", "base": "https://sha.go.ke", "kw": ["shif", "2.75%", "empanelment", "household"]},
+    # === 🇿🇦 SOUTH AFRICA (Gazette) ===
+    {
+        "c": "South Africa", "auth": "SARS & Labour", 
+        "url": "https://www.sars.gov.za/legal-counsel/interpretation-rulings/interpretation-notes/", 
+        "base": "https://www.sars.gov.za", 
+        "kw": ["paye", "uif", "sdl", "eti", "allowance", "fringe", "benefit", "subsistence", "travel", "reimbursement", "minimum wage", "nmw", "sectoral", "earnings"]
+    },
 
-    # === 🇿🇲 ZAMBIA (The Practice Notes) ===
-    {"c": "Zambia", "auth": "ZRA (Tax)", "url": "https://www.zra.org.zm/category/media-room/", "base": "https://www.zra.org.zm", "kw": ["practice note", "paye threshold", "tax credit", "property transfer"]},
-    {"c": "Zambia", "auth": "NAPSA (Pension)", "url": "https://www.napsa.co.zm/about/publications", "base": "https://www.napsa.co.zm", "kw": ["ceiling", "contributions", "penalty waiver"]},
-    {"c": "Zambia", "auth": "NHIMA (Health)", "url": "https://www.nhima.co.zm/publications/forms", "base": "https://www.nhima.co.zm", "kw": ["smartpay", "1%", "lapse rule"]},
+    # === 🇿🇲 ZAMBIA (Practice Notes) ===
+    {
+        "c": "Zambia", "auth": "ZRA (Tax)", 
+        "url": "https://www.zra.org.zm/category/media-room/", 
+        "base": "https://www.zra.org.zm", 
+        "kw": ["practice note", "paye threshold", "tax credit", "property transfer", "exemption", "relief"]
+    },
+    {
+        "c": "Zambia", "auth": "NAPSA (Pension)", 
+        "url": "https://www.napsa.co.zm/about/publications", 
+        "base": "https://www.napsa.co.zm", 
+        "kw": ["ceiling", "contributions", "penalty waiver", "earnings limit", "social security"]
+    },
 
     # === 🇺🇬 UGANDA (Enforcement) ===
-    {"c": "Uganda", "auth": "URA (Tax)", "url": "https://ura.go.ug/en/publications/public-notices/", "base": "https://ura.go.ug", "kw": ["agency notice", "voluntary disclosure", "tax ledger"]},
-    {"c": "Uganda", "auth": "NSSF (Social Security)", "url": "https://www.nssfug.org/media-center/legal/", "base": "https://www.nssfug.org", "kw": ["amendment act", "midterm access", "15%", "voluntary"]},
-
-    # === 🇿🇦 SOUTH AFRICA (The Gazette) ===
-    {"c": "South Africa", "auth": "SARS (Tax)", "url": "https://www.sars.gov.za/legal-counsel/interpretation-rulings/interpretation-notes/", "base": "https://www.sars.gov.za", "kw": ["interpretation note", "travel allowance", "fringe benefit"]},
-    {"c": "South Africa", "auth": "Dept Employment", "url": "https://www.labour.gov.za/DocumentCenter/Pages/Government-Gazette.aspx", "base": "https://www.labour.gov.za", "kw": ["sectoral determination", "minimum wage", "coida", "earnings threshold"]}
+    {
+        "c": "Uganda", "auth": "URA (Tax)", 
+        "url": "https://ura.go.ug/en/publications/public-notices/", 
+        "base": "https://ura.go.ug", 
+        "kw": ["agency notice", "voluntary disclosure", "tax ledger", "paye", "amnesty"]
+    },
+    {
+        "c": "Uganda", "auth": "NSSF (Social Security)", 
+        "url": "https://www.nssfug.org/media-center/legal/", 
+        "base": "https://www.nssfug.org", 
+        "kw": ["amendment act", "midterm access", "15%", "voluntary", "contribution"]
+    }
 ]
 
 # --- 3. TELEGRAM MESSENGER ---
