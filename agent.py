@@ -16,7 +16,7 @@ except KeyError:
     exit(1)
 
 genai.configure(api_key=GENAI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-pro')
 
 # --- 2. THE MASTER COMPLIANCE LIST (BASED ON YOUR RESEARCH) ---
 TARGETS = [
