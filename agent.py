@@ -178,7 +178,11 @@ def send_telegram(message):
 # --- 4. THE INTELLIGENT SCOUT ---
 def run_scout():
     print("🕵️ Global Compliance Scout Started...")
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
+    
+    # PASTE THIS LINE HERE 👇
+    send_telegram("👋 System Check: Payroll Compliance Agent is ONLINE.")
+    
+    headers = {'User-Agent': 'Mozilla/5.0...'}
     
     for t in TARGETS:
         try:
