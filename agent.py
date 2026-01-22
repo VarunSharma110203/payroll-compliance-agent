@@ -180,7 +180,6 @@ def run_scout():
     print("🕵️ Global Compliance Scout Started...")
     
     # PASTE THIS LINE HERE 👇
-    send_telegram("👋 System Check: Payroll Compliance Agent is ONLINE.")
     
     headers = {'User-Agent': 'Mozilla/5.0...'}
     
