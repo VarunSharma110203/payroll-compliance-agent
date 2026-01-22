@@ -24,7 +24,7 @@ except KeyError:
     print("❌ ERROR: Keys not found!")
     exit(1)
 
-google.genai.configure(api_key=GENAI_API_KEY)
+client = google.genai.Client(api_key=GENAI_API_KEY)
 
 # --- DATABASE SETUP ---
 def init_database():
