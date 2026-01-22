@@ -41,7 +41,7 @@ jobs:
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
           AUDIT_BOT_TOKEN: ${{ secrets.AUDIT_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python claude_audit.py
+        run: python calude_audit.py
       
       - name: Commit database changes
         run: |
