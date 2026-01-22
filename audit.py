@@ -3,7 +3,9 @@ from bs4 import BeautifulSoup
 import google.generativeai as genai
 import os
 import time
+import io
 import urllib3
+from pypdf import PdfReader
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -21,47 +23,16 @@ except KeyError:
 genai.configure(api_key=GENAI_API_KEY)
 model = genai.GenerativeModel('gemini-pro')
 
-# --- INTELLIGENT JUNK FILTER ---
-# If a link text contains these words, we delete it immediately.
-JUNK_KEYWORDS = [
-    "tender", "auction", "procurement", "holiday", "calendar", "meeting", "minutes",
-    "transfer", "posting", "promotion", "seniority", "list of", "nomination",
-    "corrigendum", "extension of date", "contact us", "feedback", "login", 
-    "screen reader", "skip to main", "click here", "read more"
-]
-
-# --- THE FULL "HEAVY DUTY" TARGET LIST (14 Sources) ---
+# --- TARGETS (Priority Sources) ---
 TARGETS = [
-    # === 🇮🇳 INDIA (Simpliance + Govt) ===
-    {"c": "India", "auth": "Simpliance Gazettes (Feed)", "url": "https://icm.simpliance.in/gazette-notifications"},
-    {"c": "India", "auth": "Income Tax (CBDT)", "url": "https://incometaxindia.gov.in/pages/communications/circulars.aspx"},
-    {"c": "India", "auth": "EPFO (Provident Fund)", "url": "https://www.epfindia.gov.in/site_en/Circulars.php"},
-    {"c": "India", "auth": "Labour Ministry", "url": "https://labour.gov.in/circulars"},
-
-    # === 🇦🇪 UAE ===
-    {"c": "UAE", "auth": "MOHRE (Labour)", "url": "https://www.mohre.gov.ae/en/laws-and-regulations/resolutions-and-circulars.aspx"},
-    {"c": "UAE", "auth": "FTA (Tax)", "url": "https://tax.gov.ae/en/taxes/Vat.aspx"},
-
-    # === 🇳🇬 NIGERIA ===
-    {"c": "Nigeria", "auth": "FIRS (Tax)", "url": "https://www.firs.gov.ng/press-release/"},
-    {"c": "Nigeria", "auth": "PenCom (Pension)", "url": "https://www.pencom.gov.ng/category/regulations-guidelines-circulars-frameworks/circulars/"},
-
-    # === 🇵🇭 PHILIPPINES ===
-    {"c": "Philippines", "auth": "BIR (Tax)", "url": "https://www.bir.gov.ph/index.php/revenue-issuances/revenue-memorandum-circulars.html"},
-    
-    # === 🇰🇪 KENYA ===
-    {"c": "Kenya", "auth": "KRA (Tax)", "url": "https://www.kra.go.ke/news-center/public-notices"},
-
-    # === 🇿🇼 ZIMBABWE ===
-    {"c": "Zimbabwe", "auth": "ZIMRA", "url": "https://www.zimra.co.zw/public-notices"},
-
-    # === 🇿🇦 SOUTH AFRICA ===
+    {"c": "India", "auth": "Simpliance Feed", "url": "https://icm.simpliance.in/gazette-notifications"},
+    {"c": "India", "auth": "Income Tax", "url": "https://incometaxindia.gov.in/pages/communications/circulars.aspx"},
+    {"c": "UAE", "auth": "MOHRE", "url": "https://www.mohre.gov.ae/en/laws-and-regulations/resolutions-and-circulars.aspx"},
+    {"c": "Nigeria", "auth": "FIRS", "url": "https://www.firs.gov.ng/press-release/"},
+    {"c": "Philippines", "auth": "BIR", "url": "https://www.bir.gov.ph/index.php/revenue-issuances/revenue-memorandum-circulars.html"},
+    {"c": "Kenya", "auth": "KRA", "url": "https://www.kra.go.ke/news-center/public-notices"},
     {"c": "South Africa", "auth": "SARS", "url": "https://www.sars.gov.za/legal-counsel/interpretation-rulings/interpretation-notes/"},
-    
-    # === 🇿🇲 ZAMBIA ===
-    {"c": "Zambia", "auth": "ZRA", "url": "https://www.zra.org.zm/category/media-room/"},
-    
-    # === 🇺🇬 UGANDA ===
+    {"c": "Zimbabwe", "auth": "ZIMRA", "url": "https://www.zimra.co.zw/public-notices"},
     {"c": "Uganda", "auth": "URA", "url": "https://ura.go.ug/en/publications/public-notices/"}
 ]
 
@@ -80,97 +51,130 @@ def create_session():
     session.mount('https://', adapter)
     return session
 
+# --- CONTENT EXTRACTOR ---
+def get_content_from_url(session, url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
+        r = session.get(url, headers=headers, timeout=20, verify=False)
+        content_type = r.headers.get('Content-Type', '').lower()
+        
+        # IF PDF -> READ IT
+        if 'pdf' in content_type or url.lower().endswith('.pdf'):
+            try:
+                f = io.BytesIO(r.content)
+                reader = PdfReader(f)
+                text = ""
+                # Read first 2 pages
+                for page in reader.pages[:2]:
+                    text += page.extract_text() + "\n"
+                return f"PDF_TEXT: {text[:2000]}"
+            except Exception as e:
+                return f"ERROR_READING_PDF: {str(e)}"
+        
+        # IF WEBSITE -> READ IT
+        else:
+            soup = BeautifulSoup(r.text, 'html.parser')
+            for script in soup(["script", "style", "nav", "footer"]):
+                script.extract()
+            text = soup.get_text()
+            # Clean text
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            text = '\n'.join(chunk for chunk in chunks if chunk)
+            return f"WEB_TEXT: {text[:2000]}"
+    except Exception as e:
+        return f"DOWNLOAD_ERROR: {str(e)}"
+
 def run_audit():
-    print("📜 Starting Full Smart Audit...")
-    send_telegram("📜 **Full Smart Compliance Audit Started**\n_Scanning 14 sources & filtering junk..._")
+    print("📜 Starting Deep Content Reader...")
+    send_telegram("📜 **Deep Reader Activated**\n_Opening documents & reading text..._")
     
     session = create_session()
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
 
     for t in TARGETS:
         try:
-            print(f"   Scanning {t['c']} - {t['auth']}...")
+            print(f"   Scanning {t['c']}...")
             try:
-                # 90s timeout for deep loading
-                r = session.get(t['url'], headers=headers, timeout=90, verify=False)
+                r = session.get(t['url'], headers=headers, timeout=60, verify=False)
             except:
-                send_telegram(f"⚠️ **{t['c']}**: Connection Failed (Blocked).")
+                send_telegram(f"⚠️ **{t['c']}**: Website Down/Blocked.")
                 continue
 
             soup = BeautifulSoup(r.text, 'html.parser')
+            links = soup.find_all('a', href=True)
             
-            # 1. GRAB MANY LINKS (60+)
-            raw_links = soup.find_all('a', href=True)[:60]
-            clean_candidates = []
-
-            for link in raw_links:
+            # GET TOP 5 VALID LINKS
+            candidates = []
+            for link in links:
                 text = link.get_text(" ", strip=True)
                 url = link['href']
-                text_lower = text.lower()
                 
-                # 2. APPLY SMART JUNK FILTER
-                if len(text) > 10: 
-                    is_junk = False
-                    for junk in JUNK_KEYWORDS:
-                        if junk in text_lower:
-                            is_junk = True
-                            break
-                    
-                    if not is_junk:
-                        # Fix Relative URLs
+                if len(text) > 10 and "javascript" not in url:
+                    if not url.startswith("http"):
+                        base = "/".join(t['url'].split("/")[:3]) if url.startswith("/") else t['url'] + "/"
+                        url = base + url if url.startswith("/") else base + "/" + url # Messy url fix
+                        # Cleaner URL fix
                         if not url.startswith("http"):
                              if url.startswith("/"):
                                 base_domain = "/".join(t['url'].split("/")[:3])
                                 url = base_domain + url
                              else:
                                 url = t['url'] + "/" + url
-                        
-                        clean_candidates.append(f"- {text} (Link: {url})")
+                    
+                    candidates.append({"title": text, "url": url})
+                    if len(candidates) >= 5: # Stop at 5
+                        break
 
-            # 3. AI ANALYSIS (Only on the Clean List)
-            if clean_candidates:
-                # Limit to top 25 CLEAN links to avoid token limits
-                final_list_str = "\n".join(clean_candidates[:25])
+            # ANALYZE CONTENT
+            if not candidates:
+                 send_telegram(f"⚠️ **{t['c']}**: No links found.")
+                 continue
+
+            findings = []
+            for item in candidates:
+                # 1. READ CONTENT
+                content = get_content_from_url(session, item['url'])
                 
+                if "ERROR" in content:
+                    continue # Skip broken files
+
+                # 2. ASK AI
                 prompt = f"""
-                You are a Senior Compliance Auditor.
-                Source: {t['auth']} ({t['c']}).
-                
-                Here is a filtered list of documents from the government website.
+                You are a Compliance Officer.
+                Document: "{item['title']}"
+                Content Snippet:
+                {content}
                 
                 Task:
-                1. Identify the **Top 3-5 Most Critical Regulatory Changes** (Tax, Payroll, Wages).
-                2. Look for key terms: "Amendment", "Act", "Circular", "Finance Bill".
-                3. Summarize them professionally.
-                4. **Ignore** anything older than 2024 unless it is a major Act.
-                5. If links look like general navigation (e.g. "Sitemap", "Home"), ignore them.
+                1. Is this a **Critical Payroll/Tax Update**? 
+                2. Ignore: Tenders, Holidays, Meetings, General News.
+                3. If Critical, summarize in 1 sentence.
+                4. If Junk, reply "SKIP".
                 
-                Filtered Data:
-                {final_list_str} 
-
-                Output Format (Markdown):
-                🌍 **AUDIT: {t['c'].upper()}**
-                
-                **Critical Updates:**
-                • [Date/ID] **[Title]**
-                  - [1-sentence summary]
+                Output: [Date] [Summary]
                 """
                 
                 try:
                     res = model.generate_content(prompt)
-                    report = res.text.strip()
-                    send_telegram(report)
-                    print(f"   ✅ Report sent for {t['c']}")
-                    time.sleep(5) # Safety pause for Telegram limits
+                    ans = res.text.strip()
+                    if "SKIP" not in ans:
+                        findings.append(f"📄 [{item['title']}]({item['url']})\n{ans}")
+                        time.sleep(2)
                 except Exception as e:
-                    send_telegram(f"⚠️ **{t['c']}**: AI Analysis Failed.")
-            else:
-                 send_telegram(f"⚠️ **{t['c']}**: No relevant documents found after junk filtering.")
+                    # Log the specific error if it happens again
+                    print(f"AI Error: {e}")
+                    pass
+
+            if findings:
+                report = f"🌍 **DEEP READ: {t['c'].upper()}**\n" + "\n\n".join(findings)
+                send_telegram(report)
+                time.sleep(4)
 
         except Exception as e:
             print(f"Error {t['c']}: {e}")
 
-    send_telegram("✅ **Smart Audit Complete.**")
+    send_telegram("✅ **Deep Read Complete.**")
 
 if __name__ == "__main__":
     run_audit()
