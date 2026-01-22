@@ -34,7 +34,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 google-generativeai pypdf
+          pip install requests beautifulsoup4 google-genai pypdf --force-reinstall
       
       - name: Run DRAGNET Scan
         env:
@@ -49,4 +49,4 @@ jobs:
           git config --local user.name "🚀 DRAGNET Bot"
           git add payroll_notifications.db || true
           git commit -m "🔄 DRAGNET Database Update - $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)" || true
-          git push || true
+          git push https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git || true
