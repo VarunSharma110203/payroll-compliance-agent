@@ -1,0 +1,52 @@
+name: 🚀 Payroll DRAGNET Scan
+
+on:
+  schedule:
+    # Daily at 6 AM UTC
+    - cron: '0 6 * * *'
+  
+  # Manual trigger
+  workflow_dispatch:
+
+jobs:
+  dragnet-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 google-generativeai pypdf
+      
+      - name: Run DRAGNET Scan
+        env:
+          GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
+          AUDIT_BOT_TOKEN: ${{ secrets.AUDIT_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python claude_audit.py
+      
+      - name: Commit database changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "🚀 DRAGNET Bot"
+          git add payroll_notifications.db || true
+          git commit -m "🔄 DRAGNET Database Update - $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)" || true
+          git push || true
