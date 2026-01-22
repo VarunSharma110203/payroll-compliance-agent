@@ -23,26 +23,42 @@ except KeyError:
 genai.configure(api_key=GENAI_API_KEY)
 model = genai.GenerativeModel('gemini-pro')
 
-# --- TARGETS (Priority Sources) ---
+# --- TARGETS ---
 TARGETS = [
-    {"c": "India", "auth": "Simpliance Feed", "url": "https://icm.simpliance.in/gazette-notifications"},
-    {"c": "India", "auth": "Income Tax", "url": "https://incometaxindia.gov.in/pages/communications/circulars.aspx"},
-    {"c": "UAE", "auth": "MOHRE", "url": "https://www.mohre.gov.ae/en/laws-and-regulations/resolutions-and-circulars.aspx"},
-    {"c": "Nigeria", "auth": "FIRS", "url": "https://www.firs.gov.ng/press-release/"},
+    # 🇿🇼 ZIMBABWE (Explicit Focus on FDS/Fiscal)
+    {"c": "Zimbabwe", "auth": "ZIMRA Public Notices", "url": "https://www.zimra.co.zw/public-notices"},
+    
+    # 🇳🇬 NIGERIA (Explicit Focus on Tax Slabs)
+    {"c": "Nigeria", "auth": "FIRS Press & Circulars", "url": "https://www.firs.gov.ng/press-release/"},
+    
+    # 🌍 GLOBAL OTHERS
     {"c": "Philippines", "auth": "BIR", "url": "https://www.bir.gov.ph/index.php/revenue-issuances/revenue-memorandum-circulars.html"},
+    {"c": "India", "auth": "Income Tax", "url": "https://incometaxindia.gov.in/pages/communications/circulars.aspx"},
+    {"c": "India", "auth": "EPFO", "url": "https://www.epfindia.gov.in/site_en/Circulars.php"},
+    {"c": "UAE", "auth": "MOHRE", "url": "https://www.mohre.gov.ae/en/laws-and-regulations/resolutions-and-circulars.aspx"},
     {"c": "Kenya", "auth": "KRA", "url": "https://www.kra.go.ke/news-center/public-notices"},
     {"c": "South Africa", "auth": "SARS", "url": "https://www.sars.gov.za/legal-counsel/interpretation-rulings/interpretation-notes/"},
-    {"c": "Zimbabwe", "auth": "ZIMRA", "url": "https://www.zimra.co.zw/public-notices"},
     {"c": "Uganda", "auth": "URA", "url": "https://ura.go.ug/en/publications/public-notices/"}
 ]
 
+# --- THE "KILLER" KEYWORDS ---
+# The bot will prioritize ANY link containing these words
+PRIORITY_KEYWORDS = [
+    # Universal High Value
+    "tax", "finance act", "amendment", "slab", "rate", "wage", "salary", 
+    "circular", "regulation", "bill", "gazette", "compliance", "levy", "duty", 
+    # Zimbabwe Specific
+    "fds", "fiscal", "device", "non-fds", "currency", "ziq",
+    # Nigeria Specific
+    "finance", "exemption", "relief", "deduction"
+]
+
 def send_telegram(message):
+    if len(message) > 4000: message = message[:4000] + "..."
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True}
-    try:
-        requests.post(url, json=payload, timeout=20)
-    except:
-        pass
+    try: requests.post(url, json=payload, timeout=20)
+    except: pass
 
 def create_session():
     session = requests.Session()
@@ -51,43 +67,31 @@ def create_session():
     session.mount('https://', adapter)
     return session
 
-# --- CONTENT EXTRACTOR ---
 def get_content_from_url(session, url):
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
-        r = session.get(url, headers=headers, timeout=20, verify=False)
+        r = session.get(url, headers=headers, timeout=25, verify=False) # Increased timeout
         content_type = r.headers.get('Content-Type', '').lower()
         
-        # IF PDF -> READ IT
         if 'pdf' in content_type or url.lower().endswith('.pdf'):
             try:
                 f = io.BytesIO(r.content)
                 reader = PdfReader(f)
                 text = ""
-                # Read first 2 pages
-                for page in reader.pages[:2]:
+                # Read 3 pages to capture hidden details
+                for page in reader.pages[:3]: 
                     text += page.extract_text() + "\n"
-                return f"PDF_TEXT: {text[:2000]}"
-            except Exception as e:
-                return f"ERROR_READING_PDF: {str(e)}"
-        
-        # IF WEBSITE -> READ IT
+                return f"PDF_TEXT: {text[:2500]}"
+            except: return "ERROR_READING_PDF"
         else:
             soup = BeautifulSoup(r.text, 'html.parser')
-            for script in soup(["script", "style", "nav", "footer"]):
-                script.extract()
-            text = soup.get_text()
-            # Clean text
-            lines = (line.strip() for line in text.splitlines())
-            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-            text = '\n'.join(chunk for chunk in chunks if chunk)
-            return f"WEB_TEXT: {text[:2000]}"
-    except Exception as e:
-        return f"DOWNLOAD_ERROR: {str(e)}"
+            for s in soup(["script", "style"]): s.extract()
+            return f"WEB_TEXT: {soup.get_text()[:2500]}"
+    except Exception as e: return f"DOWNLOAD_ERROR: {str(e)}"
 
 def run_audit():
-    print("📜 Starting Deep Content Reader...")
-    send_telegram("📜 **Deep Reader Activated**\n_Opening documents & reading text..._")
+    print("📜 Starting HUNTER Scan...")
+    send_telegram("🚨 **HUNTER MODE ACTIVATED**\n_Deep scanning 60 links/site. Hunting for 'Tax Slabs', 'FDS', 'Acts'..._")
     
     session = create_session()
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
@@ -95,86 +99,93 @@ def run_audit():
     for t in TARGETS:
         try:
             print(f"   Scanning {t['c']}...")
-            try:
-                r = session.get(t['url'], headers=headers, timeout=60, verify=False)
-            except:
-                send_telegram(f"⚠️ **{t['c']}**: Website Down/Blocked.")
+            try: r = session.get(t['url'], headers=headers, timeout=60, verify=False)
+            except: 
+                send_telegram(f"⚠️ **{t['c']}**: Site Unreachable.")
                 continue
 
             soup = BeautifulSoup(r.text, 'html.parser')
             links = soup.find_all('a', href=True)
             
-            # GET TOP 5 VALID LINKS
+            # 1. SCAN DEEP (Top 60 Links)
             candidates = []
-            for link in links:
+            # We look at the first 60 links to catch updates buried deep
+            for link in links[:60]: 
                 text = link.get_text(" ", strip=True)
                 url = link['href']
                 
-                if len(text) > 10 and "javascript" not in url:
+                # Filter out junk (short text)
+                if len(text) > 4 and "javascript" not in url:
+                    # Fix URL
                     if not url.startswith("http"):
-                        base = "/".join(t['url'].split("/")[:3]) if url.startswith("/") else t['url'] + "/"
-                        url = base + url if url.startswith("/") else base + "/" + url # Messy url fix
-                        # Cleaner URL fix
-                        if not url.startswith("http"):
-                             if url.startswith("/"):
-                                base_domain = "/".join(t['url'].split("/")[:3])
-                                url = base_domain + url
-                             else:
-                                url = t['url'] + "/" + url
+                        if url.startswith("/"): url = "/".join(t['url'].split("/")[:3]) + url
+                        else: url = t['url'].rsplit('/', 1)[0] + "/" + url
                     
-                    candidates.append({"title": text, "url": url})
-                    if len(candidates) >= 5: # Stop at 5
-                        break
+                    # 2. INTELLIGENT SCORING
+                    score = 0
+                    text_lower = text.lower()
+                    
+                    # Bonus points for Keywords
+                    for word in PRIORITY_KEYWORDS:
+                        if word in text_lower:
+                            score += 10 
+                    
+                    # Zimbabwe Special: If it mentions FDS, huge boost
+                    if t['c'] == "Zimbabwe" and ("fds" in text_lower or "fiscal" in text_lower):
+                        score += 50
+                    
+                    # Keep if it has keywords OR is very recent (top 5 on page)
+                    if score > 0 or len(candidates) < 5:
+                        candidates.append({"title": text, "url": url, "score": score})
 
-            # ANALYZE CONTENT
-            if not candidates:
-                 send_telegram(f"⚠️ **{t['c']}**: No links found.")
-                 continue
+            # Sort by Priority (Highest score first)
+            candidates = sorted(candidates, key=lambda x: x['score'], reverse=True)
+            
+            # Read the Top 8 Highest Priority items
+            top_targets = candidates[:8]
+            
+            if not top_targets:
+                send_telegram(f"⚠️ **{t['c']}**: Scanned 60 links. No keywords found.")
+                continue
 
             findings = []
-            for item in candidates:
-                # 1. READ CONTENT
+            for item in top_targets:
+                # 3. DEEP READ CONTENT
                 content = get_content_from_url(session, item['url'])
-                
-                if "ERROR" in content:
-                    continue # Skip broken files
+                if "ERROR" in content: continue
 
-                # 2. ASK AI
                 prompt = f"""
-                You are a Compliance Officer.
+                Role: Senior Compliance Auditor.
                 Document: "{item['title']}"
-                Content Snippet:
-                {content}
+                Content Snippet: {content}
                 
                 Task:
-                1. Is this a **Critical Payroll/Tax Update**? 
-                2. Ignore: Tenders, Holidays, Meetings, General News.
-                3. If Critical, summarize in 1 sentence.
-                4. If Junk, reply "SKIP".
+                1. Does this contain updates on **Tax Rates**, **Slabs**, **Finance Act**, **Wages**, or **ZIMRA FDS/Fiscal Devices**?
+                2. If YES, summarize the specific numbers/changes.
+                3. If it is routine/junk, reply "SKIP".
                 
-                Output: [Date] [Summary]
+                Output: [Date/Type] [Summary]
                 """
                 
                 try:
                     res = model.generate_content(prompt)
                     ans = res.text.strip()
                     if "SKIP" not in ans:
-                        findings.append(f"📄 [{item['title']}]({item['url']})\n{ans}")
+                        findings.append(f"🔴 **PRIORITY UPDATE**\n[{item['title']}]({item['url']})\n{ans}")
                         time.sleep(2)
-                except Exception as e:
-                    # Log the specific error if it happens again
-                    print(f"AI Error: {e}")
-                    pass
+                except: pass
 
             if findings:
-                report = f"🌍 **DEEP READ: {t['c'].upper()}**\n" + "\n\n".join(findings)
+                report = f"🌍 **HUNTER RESULT: {t['c'].upper()}**\n" + "\n\n".join(findings)
                 send_telegram(report)
                 time.sleep(4)
+            else:
+                send_telegram(f"✅ **{t['c']}**: Scanned 60 links. Checked top {len(top_targets)} priority docs. No Critical Updates found.")
 
         except Exception as e:
             print(f"Error {t['c']}: {e}")
 
-    send_telegram("✅ **Deep Read Complete.**")
+    send_telegram("✅ **Hunter Scan Complete.**")
 
 if __name__ == "__main__":
     run_audit()
