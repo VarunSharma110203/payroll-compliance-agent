@@ -200,10 +200,9 @@ CHANGE_DETAILS: [Specific change that affects employers]
 EFFECTIVE_DATE: [Date when this takes effect or UNKNOWN]
 ACTION_REQUIRED: [What employers must do]"""
         
-        response = google.genai.Client().models.generate_content(
+        response = client.models.generate_content(
             model="models/gemini-2.0-flash",
-            contents=prompt,
-            config={"max_output_tokens": 300}
+            contents=prompt
         )
         ans = response.text.strip()
         
