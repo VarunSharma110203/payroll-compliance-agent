@@ -20,7 +20,7 @@ jobs:
 
       - name: Install Libraries
         run: |
-          pip install requests beautifulsoup4 google-generativeai urllib3
+          pip install requests beautifulsoup4 google-generativeai urllib3 pypdf
 
       - name: Run Audit Script
         env:
