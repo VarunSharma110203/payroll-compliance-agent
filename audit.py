@@ -7,22 +7,30 @@ import urllib3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# --- 0. CONFIGURATION ---
+# --- CONFIGURATION ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
     GENAI_API_KEY = os.environ["GEMINI_KEY"]
-    # 👇 This uses the NEW token you just saved
     TELEGRAM_TOKEN = os.environ["AUDIT_BOT_TOKEN"]
     TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 except KeyError:
-    print("❌ ERROR: Keys not found! Check GitHub Secrets.")
+    print("❌ ERROR: Keys not found!")
     exit(1)
 
 genai.configure(api_key=GENAI_API_KEY)
 model = genai.GenerativeModel('gemini-pro')
 
-# --- 1. THE DEEP SCAN TARGET LIST (15+ Sources) ---
+# --- INTELLIGENT JUNK FILTER ---
+# If a link text contains these words, we delete it immediately.
+JUNK_KEYWORDS = [
+    "tender", "auction", "procurement", "holiday", "calendar", "meeting", "minutes",
+    "transfer", "posting", "promotion", "seniority", "list of", "nomination",
+    "corrigendum", "extension of date", "contact us", "feedback", "login", 
+    "screen reader", "skip to main", "click here", "read more"
+]
+
+# --- THE FULL "HEAVY DUTY" TARGET LIST (14 Sources) ---
 TARGETS = [
     # === 🇮🇳 INDIA (Simpliance + Govt) ===
     {"c": "India", "auth": "Simpliance Gazettes (Feed)", "url": "https://icm.simpliance.in/gazette-notifications"},
@@ -59,12 +67,7 @@ TARGETS = [
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID, 
-        "text": message, 
-        "parse_mode": "Markdown", 
-        "disable_web_page_preview": True
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True}
     try:
         requests.post(url, json=payload, timeout=20)
     except:
@@ -78,9 +81,8 @@ def create_session():
     return session
 
 def run_audit():
-    print("📜 Starting Deep Audit...")
-    # Send intro message
-    send_telegram("📜 **Deep Compliance Audit Started**\n_Scanning 15+ sources for 6-month history..._")
+    print("📜 Starting Full Smart Audit...")
+    send_telegram("📜 **Full Smart Compliance Audit Started**\n_Scanning 14 sources & filtering junk..._")
     
     session = create_session()
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
@@ -88,64 +90,87 @@ def run_audit():
     for t in TARGETS:
         try:
             print(f"   Scanning {t['c']} - {t['auth']}...")
-            
-            # 1. FETCH LINKS
             try:
-                r = session.get(t['url'], headers=headers, timeout=60, verify=False)
+                # 90s timeout for deep loading
+                r = session.get(t['url'], headers=headers, timeout=90, verify=False)
             except:
-                print(f"   ⚠️ Skip {t['auth']}")
+                send_telegram(f"⚠️ **{t['c']}**: Connection Failed (Blocked).")
                 continue
 
             soup = BeautifulSoup(r.text, 'html.parser')
             
-            # DEEP SCAN: 40 Links (To cover 6 months)
-            links = soup.find_all('a', href=True)[:40]
-            data_pile = []
+            # 1. GRAB MANY LINKS (60+)
+            raw_links = soup.find_all('a', href=True)[:60]
+            clean_candidates = []
 
-            for link in links:
+            for link in raw_links:
                 text = link.get_text(" ", strip=True)
                 url = link['href']
+                text_lower = text.lower()
+                
+                # 2. APPLY SMART JUNK FILTER
                 if len(text) > 10: 
-                    data_pile.append(f"- {text} (Link: {url})")
+                    is_junk = False
+                    for junk in JUNK_KEYWORDS:
+                        if junk in text_lower:
+                            is_junk = True
+                            break
+                    
+                    if not is_junk:
+                        # Fix Relative URLs
+                        if not url.startswith("http"):
+                             if url.startswith("/"):
+                                base_domain = "/".join(t['url'].split("/")[:3])
+                                url = base_domain + url
+                             else:
+                                url = t['url'] + "/" + url
+                        
+                        clean_candidates.append(f"- {text} (Link: {url})")
 
-            # 2. AI ANALYSIS
-            if data_pile:
+            # 3. AI ANALYSIS (Only on the Clean List)
+            if clean_candidates:
+                # Limit to top 25 CLEAN links to avoid token limits
+                final_list_str = "\n".join(clean_candidates[:25])
+                
                 prompt = f"""
-                You are a Compliance Auditor.
+                You are a Senior Compliance Auditor.
                 Source: {t['auth']} ({t['c']}).
                 
-                Task: Identify key regulatory changes from late 2025 to 2026.
-                - Ignore irrelevant items (Tenders, Holidays, Transfers).
-                - Summarize the top 3-5 changes.
-                - If nothing major found, mention "No major updates".
+                Here is a filtered list of documents from the government website.
                 
-                Raw Data:
-                {str(data_pile[:50])} 
+                Task:
+                1. Identify the **Top 3-5 Most Critical Regulatory Changes** (Tax, Payroll, Wages).
+                2. Look for key terms: "Amendment", "Act", "Circular", "Finance Bill".
+                3. Summarize them professionally.
+                4. **Ignore** anything older than 2024 unless it is a major Act.
+                5. If links look like general navigation (e.g. "Sitemap", "Home"), ignore them.
+                
+                Filtered Data:
+                {final_list_str} 
 
-                Output Format:
-                🌍 **AUDIT: {t['c'].upper()}** ({t['auth']})
+                Output Format (Markdown):
+                🌍 **AUDIT: {t['c'].upper()}**
                 
-                **Key Updates:**
-                • [Date/Title] - [Summary]
+                **Critical Updates:**
+                • [Date/ID] **[Title]**
+                  - [1-sentence summary]
                 """
                 
                 try:
                     res = model.generate_content(prompt)
                     report = res.text.strip()
                     send_telegram(report)
-                    
-                    # 🔴 CRITICAL SAFETY PAUSE
-                    # We wait 5 seconds between messages so Telegram doesn't block the bot
                     print(f"   ✅ Report sent for {t['c']}")
-                    time.sleep(5) 
-                    
-                except Exception:
-                    pass
+                    time.sleep(5) # Safety pause for Telegram limits
+                except Exception as e:
+                    send_telegram(f"⚠️ **{t['c']}**: AI Analysis Failed.")
+            else:
+                 send_telegram(f"⚠️ **{t['c']}**: No relevant documents found after junk filtering.")
 
         except Exception as e:
             print(f"Error {t['c']}: {e}")
 
-    send_telegram("✅ **Audit Complete.**")
+    send_telegram("✅ **Smart Audit Complete.**")
 
 if __name__ == "__main__":
     run_audit()
