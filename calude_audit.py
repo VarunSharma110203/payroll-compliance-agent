@@ -1,6 +1,6 @@
 import requests
 from bs4 import BeautifulSoup
-import google.generativeai as genai
+import google.genai
 import os
 import time
 import io
@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from pypdf import PdfReader
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 # --- CONFIGURATION ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -24,8 +24,7 @@ except KeyError:
     print("❌ ERROR: Keys not found!")
     exit(1)
 
-genai.configure(api_key=GENAI_API_KEY)
-model = genai.GenerativeModel('gemini-pro')
+google.genai.configure(api_key=GENAI_API_KEY)
 
 # --- DATABASE SETUP ---
 def init_database():
@@ -143,17 +142,14 @@ def extract_links_from_page(session, url, headers, timeout=8):
 
 # --- PAGINATION HANDLER ---
 def get_all_pages(session, base_url, headers, max_pages=2):
-    """Try common pagination patterns - FAST"""
     all_links = []
     
-    # Get main page first
     try:
         main_links = extract_links_from_page(session, base_url, headers, timeout=8)
         all_links.extend(main_links)
     except:
         pass
     
-    # Try page 2 only (not all pages)
     for page_num in [2]:
         variants = [
             f"{base_url}?page={page_num}",
@@ -169,7 +165,6 @@ def get_all_pages(session, base_url, headers, max_pages=2):
             except:
                 continue
     
-    # Remove duplicates
     seen = set()
     unique_links = []
     for link in all_links:
@@ -187,7 +182,7 @@ def analyze_with_ai(title, content, country):
 
 COUNTRY: {country}
 TITLE: {title}
-CONTENT: {content[:1500]}
+CONTENT: {content[:1000]}
 
 CRITICAL QUESTION:
 Does this document require EMPLOYERS to change their:
@@ -201,19 +196,16 @@ Does this document require EMPLOYERS to change their:
 RESPOND EXACTLY IN THIS FORMAT (no extra text):
 CRUCIAL: [YES/NO]
 IMPACT_TYPE: [Tax/Deduction/Salary/Contribution/Compliance/Other or NONE]
-CHANGE_DETAILS: [Specific change that affects employers - be detailed]
+CHANGE_DETAILS: [Specific change that affects employers]
 EFFECTIVE_DATE: [Date when this takes effect or UNKNOWN]
-ACTION_REQUIRED: [What employers must do - be specific]
-
-Example from Nigeria Tax Slab Change:
-CRUCIAL: YES
-IMPACT_TYPE: Tax
-CHANGE_DETAILS: Personal income tax slabs revised - annual income ₦100k-₦3m now attracts 5% instead of 7%, ₦3m-₦12m attracts 11% instead of 12%, ₦12m+ attracts 21% instead of 19%
-EFFECTIVE_DATE: 2023-06-01
-ACTION_REQUIRED: Recalculate monthly tax withholding for all employees based on new slabs; update payroll system by June 2023"""
+ACTION_REQUIRED: [What employers must do]"""
         
-        res = model.generate_content(prompt, generation_config={"max_output_tokens": 300})
-        ans = res.text.strip()
+        response = google.genai.Client().models.generate_content(
+            model="models/gemini-2.0-flash",
+            contents=prompt,
+            config={"max_output_tokens": 300}
+        )
+        ans = response.text.strip()
         
         if "CRUCIAL: YES" in ans:
             lines = ans.split('\n')
@@ -236,7 +228,7 @@ ACTION_REQUIRED: Recalculate monthly tax withholding for all employees based on 
         print(f"AI Error: {e}")
         return {'relevant': False}
 
-# --- TARGET SOURCES (ALL COUNTRIES) ---
+# --- TARGET SOURCES ---
 TARGETS = [
     {"c": "India", "auth": "EPFO", "url": "https://www.epfindia.gov.in/site_en/circulars.php"},
     {"c": "India", "auth": "Income Tax", "url": "https://incometaxindia.gov.in/pages/communications/circulars.aspx"},
@@ -255,7 +247,7 @@ TARGETS = [
 # --- MAIN SCAN ---
 def run_full_scan():
     print("🚀 DRAGNET SCAN STARTING...\n")
-    send_telegram("🚀 *DRAGNET Scan Started*\n_Scanning payroll notifications..._")
+    send_telegram("🚀 *DRAGNET Scan Started*\n_Scanning all countries for payroll notifications..._")
     
     conn = init_database()
     session = create_session()
@@ -267,7 +259,7 @@ def run_full_scan():
     for target in TARGETS:
         country = target['c']
         url = target['url']
-        print(f"\n📍 Scanning {country}...")
+        print(f"\n📍 Scanning {country} ({target['auth']})...")
         
         try:
             candidates = get_all_pages(session, url, headers, max_pages=2)
@@ -278,7 +270,7 @@ def run_full_scan():
             
             country_findings = []
             
-            for idx, item in enumerate(candidates[:10]):  # Only check first 10
+            for idx, item in enumerate(candidates[:10]):
                 if is_already_sent(conn, item['url']):
                     continue
                 
