@@ -1,31 +1,43 @@
-name: Run 6-Month Audit
+name: Payroll Compliance Audit
 
 on:
-  workflow_dispatch: # This creates the Manual Button
+  schedule:
+    # Runs at 06:00 UTC every day
+    - cron: '0 6 * * *'
+  workflow_dispatch: # Allows you to click "Run Now" manually
+
+permissions:
+  contents: write # Needed to save the database back to the repo
 
 jobs:
-  audit_mission:
+  run_audit:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      
+
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: '3.9'
 
-      - name: Install Libraries
+      - name: Install dependencies
         run: |
-          pip install requests beautifulsoup4 google-generativeai urllib3 pypdf
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 urllib3
 
       - name: Run Audit Script
         env:
-          GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
-          # 👇 This connects the specific Audit Token
           AUDIT_BOT_TOKEN: ${{ secrets.AUDIT_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python audit.py
+
+      - name: Commit and Push Database
+        # This saves the DB so the bot remembers what it sent
+        run: |
+          git config --global user.name "Audit Bot"
+          git config --global user.email "bot@noreply.github.com"
+          git add payroll_audit.db
+          # Only commit if the db actually changed
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update audit database" && git push)
