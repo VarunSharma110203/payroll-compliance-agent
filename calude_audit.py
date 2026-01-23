@@ -1,5 +1,43 @@
-import requests
+def is_within_6_months(date_str):
+    """Check if date is within last 6 months"""
+    if date_str == "UNKNOWN":
+        return True  # Include if we can't determine date
+    
+    try:
+        # Try to parse date string
+        for fmt in ["%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%B %d, %Y"]:
+            try:
+                doc_date = datetime.strptime(date_str, fmt)
+                cutoff = datetime.now() - timedelta(days=180)
+                return doc_date >= cutoff
+            except:
+                continue
+        return True  # If we can't parse, include it
+    except:
+        return Truedef get_pdf_content(session, url):
+    """Extract text from PDF"""
+    try:
+        r = session.get(url, timeout=15, verify=False)
+        pdf = PdfReader(io.BytesIO(r.content))
+        text = ""
+        for page in pdf.pages[:3]:  # First 3 pages only
+            text += page.extract_text() + "\n"
+        return text[:2000]
+    except:
+        return ""
+
+def get_page_content(session, url):
+    """Extract text from web page"""
+    try:
+        r = session.get(url, timeout=10, verify=False)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        for s in soup(["script", "style"]):
+            s.extract()
+        return soup.get_text()[:2000]
+    except:
+        return ""import requests
 from bs4 import BeautifulSoup
+import google.genai
 import os
 import time
 import urllib3
@@ -9,15 +47,20 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from urllib.parse import urljoin
 import re
+import io
+from pypdf import PdfReader
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
+    GEMINI_API_KEY = os.environ["GEMINI_KEY"]
     TELEGRAM_TOKEN = os.environ["AUDIT_BOT_TOKEN"]
     TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 except KeyError:
     print("❌ ERROR: Keys not found!")
     exit(1)
+
+client = google.genai.Client(api_key=GEMINI_API_KEY)
 
 # --- DATABASE ---
 def init_database():
@@ -48,7 +91,8 @@ def get_last_run(conn, country):
     result = c.fetchone()
     if result:
         return datetime.fromisoformat(result[0])
-    return datetime.now() - timedelta(days=30)
+    # FIRST RUN: Look back 6 months
+    return datetime.now() - timedelta(days=180)
 
 def update_last_run(conn, country):
     c = conn.cursor()
@@ -184,7 +228,7 @@ CHANGE_KEYWORDS = {
 }
 
 def detect_change(country, title, content=""):
-    """Detect if document is a POLICY CHANGE"""
+    """Detect if document is a POLICY CHANGE using AI + keywords"""
     combined = (title + " " + content).lower()
     
     if country not in CHANGE_KEYWORDS:
@@ -192,22 +236,52 @@ def detect_change(country, title, content=""):
     
     keywords = CHANGE_KEYWORDS[country]
     
-    # Check if it's an official document type
+    # Quick check: must be official document type
     is_circular = any(kw in combined for kw in keywords["circular_type"])
     if not is_circular:
         return None, []
     
-    # Check for rate/rule changes
-    matched_changes = [kw for kw in keywords["rate_change"] if kw in combined]
-    if not matched_changes:
+    # Quick check: must mention change/rate/amendment
+    has_change_keyword = any(kw in combined for kw in keywords["rate_change"])
+    if not has_change_keyword:
         return None, []
     
-    # Check for effective date
-    has_date = any(kw in combined for kw in keywords["effective_date"]) or extract_date(combined)
+    # If we have content and it's substantial, use AI for deeper analysis
+    if len(content) > 100:
+        try:
+            prompt = f"""Analyze this government payroll document and answer ONLY:
+1. Is this a POLICY CHANGE (tax rate, minimum wage, contribution, penalty, etc.)? YES or NO
+2. What specifically changed? (max 1 line)
+3. Extract effective date if mentioned
+
+Document:
+Country: {country}
+Title: {title}
+Content: {content[:1000]}
+
+Format response as:
+POLICY_CHANGE: [YES/NO]
+CHANGE_SUMMARY: [what changed]
+EFFECTIVE_DATE: [date or UNKNOWN]"""
+            
+            response = client.models.generate_content(
+                model="models/gemini-2.0-flash",
+                contents=prompt
+            )
+            
+            ans = response.text.strip()
+            if "POLICY_CHANGE: YES" in ans:
+                # Extract effective date from AI response
+                date_match = re.search(r'EFFECTIVE_DATE:\s*(.+?)(?:\n|$)', ans)
+                effective_date = date_match.group(1).strip() if date_match else "UNKNOWN"
+                return "POLICY_CHANGE", [effective_date]
+        
+        except Exception as e:
+            print(f"      ⚠️ AI error: {str(e)[:40]}")
     
-    change_type = "POLICY_CHANGE" if matched_changes else None
-    
-    return change_type, matched_changes if has_date else []
+    # Fallback to keyword matching
+    matched_changes = [kw for kw in keywords["rate_change"] if kw in combined]
+    return "POLICY_CHANGE" if matched_changes else None, matched_changes
 
 # --- FETCH WITH RETRY ---
 def fetch_links(session, url, headers, retries=3):
@@ -275,7 +349,8 @@ REPOSITORIES = {
 # --- MAIN SCAN ---
 def run_full_scan():
     print("🚀 DRAGNET SCAN STARTING...\n")
-    send_telegram("🚀 *DRAGNET SCAN INITIATED*\n_Searching for policy changes since last run..._")
+    print("📅 Scanning for policy changes from LAST 6 MONTHS\n")
+    send_telegram("🚀 *DRAGNET SCAN INITIATED*\n_Scanning last 6 months for policy changes..._\n⏱️ This may take 10-15 minutes")
     
     conn = init_database()
     session = create_session()
@@ -301,18 +376,23 @@ def run_full_scan():
                     
                     title = item['title']
                     url = item['url']
-                    
-                    # PRIORITIZE PDFs - they usually contain actual policy documents
                     is_pdf = url.lower().endswith('.pdf')
                     
-                    # Detect policy changes ONLY
-                    change_type, matched_keywords = detect_change(country, title)
+                    # Extract content from PDF or page
+                    print(f"      📥 Reading: {title[:50]}...")
+                    content = get_pdf_content(session, url) if is_pdf else get_page_content(session, url)
+                    
+                    # Detect policy changes (with AI analysis of content)
+                    change_type, matched_keywords = detect_change(country, title, content)
                     
                     if change_type:
-                        # Extract date from filename first (for PDFs), then from title
                         doc_date = extract_date(url) if is_pdf else extract_date(title)
                         
-                        keywords_str = ", ".join(matched_keywords[:5])
+                        # FILTER: Only include if from last 6 months
+                        if not is_within_6_months(doc_date):
+                            continue
+                        
+                        keywords_str = ", ".join(matched_keywords[:5]) if matched_keywords else "Policy Change"
                         
                         if save_notification(conn, country, title, url, doc_date, source['type'], change_type, keywords_str):
                             mark_as_sent(conn, url)
@@ -326,8 +406,8 @@ def run_full_scan():
                             })
                             total_found += 1
                             pdf_icon = "📄" if is_pdf else "📋"
-                            print(f"      ✅ {pdf_icon} CHANGE: {title[:60]}")
-                            time.sleep(0.5)
+                            print(f"      ✅ {pdf_icon} CHANGE DETECTED: {title[:55]}")
+                            time.sleep(1)
                 
             except Exception as e:
                 print(f"      ⚠️ {str(e)[:50]}")
