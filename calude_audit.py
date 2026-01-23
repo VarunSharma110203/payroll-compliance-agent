@@ -1,32 +1,24 @@
 import requests
 from bs4 import BeautifulSoup
-import google.genai
 import os
 import time
-import io
 import urllib3
-import json
 import sqlite3
-from datetime import datetime, timedelta
-from pypdf import PdfReader
+from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from urllib.parse import urljoin
 
-# --- CONFIGURATION ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
-    GENAI_API_KEY = os.environ["GEMINI_KEY"]
     TELEGRAM_TOKEN = os.environ["AUDIT_BOT_TOKEN"]
     TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 except KeyError:
     print("❌ ERROR: Keys not found!")
     exit(1)
 
-client = google.genai.Client(api_key=GENAI_API_KEY)
-
-# --- DATABASE SETUP ---
+# --- DATABASE ---
 def init_database():
     conn = sqlite3.connect('payroll_notifications.db')
     c = conn.cursor()
@@ -35,11 +27,9 @@ def init_database():
         country TEXT,
         title TEXT,
         url TEXT UNIQUE,
-        content_date TEXT,
         found_at TEXT,
         sent_to_telegram BOOLEAN DEFAULT 0,
-        source_type TEXT,
-        impact_data TEXT
+        source_type TEXT
     )''')
     conn.commit()
     return conn
@@ -49,13 +39,12 @@ def is_already_sent(conn, url):
     c.execute('SELECT id FROM notifications WHERE url = ? AND sent_to_telegram = 1', (url,))
     return c.fetchone() is not None
 
-def save_notification(conn, country, title, url, content_date, source_type, impact_data=None):
+def save_notification(conn, country, title, url, source_type):
     c = conn.cursor()
     try:
-        impact_json = json.dumps(impact_data) if impact_data else '{}'
-        c.execute('''INSERT INTO notifications (country, title, url, content_date, found_at, source_type, impact_data)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                  (country, title, url, content_date, datetime.now().isoformat(), source_type, impact_json))
+        c.execute('''INSERT INTO notifications (country, title, url, found_at, source_type)
+                     VALUES (?, ?, ?, ?, ?)''',
+                  (country, title, url, datetime.now().isoformat(), source_type))
         conn.commit()
         return True
     except sqlite3.IntegrityError:
@@ -79,11 +68,10 @@ def send_telegram(message):
     }
     try:
         requests.post(url, json=payload, timeout=10)
-        print("✅ Message sent to Telegram")
     except Exception as e:
-        print(f"⚠️ Failed to send Telegram: {e}")
+        print(f"⚠️ Telegram error: {e}")
 
-# --- SESSION MANAGEMENT ---
+# --- SESSION ---
 def create_session():
     session = requests.Session()
     retry = Retry(connect=2, backoff_factor=0.5, total=2)
@@ -92,230 +80,270 @@ def create_session():
     session.mount('http://', adapter)
     return session
 
-# --- CONTENT EXTRACTION ---
-def get_content_from_url(session, url, timeout=10):
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        r = session.get(url, headers=headers, timeout=timeout, verify=False)
-        content_type = r.headers.get('Content-Type', '').lower()
-        
-        if 'pdf' in content_type or url.lower().endswith('.pdf'):
-            try:
-                f = io.BytesIO(r.content)
-                reader = PdfReader(f)
-                text = ""
-                for page in reader.pages[:2]:
-                    text += page.extract_text() + "\n"
-                return f"PDF_TEXT: {text[:2000]}"
-            except:
-                return None
-        else:
+# --- EXTRACT LINKS WITH RETRIES ---
+def extract_links_from_page(session, url, headers, timeout=15, retries=3):
+    for attempt in range(retries):
+        try:
+            print(f"   Attempting fetch (try {attempt+1}/{retries})...")
+            r = session.get(url, headers=headers, timeout=timeout, verify=False)
             soup = BeautifulSoup(r.text, 'html.parser')
-            for s in soup(["script", "style"]):
-                s.extract()
-            text = soup.get_text()[:2000]
-            return f"WEB_TEXT: {text}" if text.strip() else None
-    except:
-        return None
-
-# --- LINK EXTRACTION ---
-def extract_links_from_page(session, url, headers, timeout=8):
-    try:
-        r = session.get(url, headers=headers, timeout=timeout, verify=False)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        links = soup.find_all('a', href=True)
-        
-        candidates = []
-        for link in links:
-            text = link.get_text(" ", strip=True)
-            href = link['href']
+            links = soup.find_all('a', href=True)
             
-            if len(text) > 3 and "javascript" not in href.lower():
-                full_url = urljoin(url, href)
-                candidates.append({"title": text, "url": full_url})
-                if len(candidates) >= 15:
-                    break
-        
-        return candidates
-    except:
-        return []
-
-# --- PAGINATION HANDLER ---
-def get_all_pages(session, base_url, headers, max_pages=2):
-    all_links = []
-    
-    try:
-        main_links = extract_links_from_page(session, base_url, headers, timeout=8)
-        all_links.extend(main_links)
-    except:
-        pass
-    
-    for page_num in [2]:
-        variants = [
-            f"{base_url}?page={page_num}",
-            f"{base_url}&page={page_num}",
-        ]
-        
-        for variant_url in variants:
-            try:
-                links = extract_links_from_page(session, variant_url, headers, timeout=6)
-                if links:
-                    all_links.extend(links)
-                    break
-            except:
-                continue
-    
-    seen = set()
-    unique_links = []
-    for link in all_links:
-        if link['url'] not in seen:
-            seen.add(link['url'])
-            unique_links.append(link)
-    
-    return unique_links[:20]
-
-# --- AI FILTERING - PAYROLL IMPACT ANALYSIS ---
-def analyze_with_ai(title, content, country):
-    """Deep AI analysis for employer payroll impact"""
-    try:
-        prompt = f"""You are a Payroll Compliance Expert. Analyze if this notification affects EMPLOYER PAYROLL OBLIGATIONS.
-
-COUNTRY: {country}
-TITLE: {title}
-CONTENT: {content[:1000]}
-
-CRITICAL QUESTION:
-Does this document require EMPLOYERS to change their:
-1. Tax withholding amounts? (e.g., tax slab changes, rate changes)
-2. Employee deductions? (e.g., pension contributions, insurance)
-3. Salary calculations? (e.g., minimum wage, allowances, gratuity)
-4. Statutory contributions? (e.g., PF, ESI, social security rates)
-5. Payment dates/methods? (e.g., new filing deadlines)
-6. Compliance requirements? (e.g., new forms, reports, validations)
-
-RESPOND EXACTLY IN THIS FORMAT (no extra text):
-CRUCIAL: [YES/NO]
-IMPACT_TYPE: [Tax/Deduction/Salary/Contribution/Compliance/Other or NONE]
-CHANGE_DETAILS: [Specific change that affects employers]
-EFFECTIVE_DATE: [Date when this takes effect or UNKNOWN]
-ACTION_REQUIRED: [What employers must do]"""
-        
-        response = client.models.generate_content(
-            model="models/gemini-2.0-flash",
-            contents=prompt
-        )
-        ans = response.text.strip()
-        
-        if "CRUCIAL: YES" in ans:
-            lines = ans.split('\n')
+            candidates = []
+            for link in links:
+                text = link.get_text(" ", strip=True)
+                href = link['href']
+                
+                if len(text) > 2 and "javascript" not in href.lower():
+                    full_url = urljoin(url, href)
+                    candidates.append({"title": text, "url": full_url})
             
-            impact_type = next((l.split(':', 1)[1].strip() for l in lines if 'IMPACT_TYPE:' in l), 'Payroll')
-            change_details = next((l.split(':', 1)[1].strip() for l in lines if 'CHANGE_DETAILS:' in l), 'Update needed')
-            effective_date = next((l.split(':', 1)[1].strip() for l in lines if 'EFFECTIVE_DATE:' in l), 'UNKNOWN')
-            action_required = next((l.split(':', 1)[1].strip() for l in lines if 'ACTION_REQUIRED:' in l), 'Review document')
-            
-            return {
-                'relevant': True,
-                'impact_type': impact_type,
-                'change_details': change_details,
-                'effective_date': effective_date,
-                'action_required': action_required,
-                'title': title
-            }
-        return {'relevant': False}
-    except Exception as e:
-        print(f"AI Error: {e}")
-        return {'relevant': False}
+            if candidates:
+                print(f"   ✓ Successfully fetched {len(candidates)} links")
+                return candidates
+        except Exception as e:
+            print(f"   ⚠️ Attempt {attempt+1} failed: {str(e)[:50]}")
+            if attempt < retries - 1:
+                wait_time = 5 * (attempt + 1)
+                print(f"   ⏳ Waiting {wait_time}s before retry...")
+                time.sleep(wait_time)
+    
+    print(f"   ❌ Failed to fetch after {retries} attempts")
+    return []
 
-# --- TARGET SOURCES ---
-TARGETS = [
-    {"c": "India", "auth": "EPFO", "url": "https://www.epfindia.gov.in/site_en/circulars.php"},
-    {"c": "India", "auth": "Income Tax", "url": "https://incometaxindia.gov.in/pages/communications/circulars.aspx"},
-    {"c": "UAE", "auth": "MOHRE", "url": "https://www.mohre.gov.ae/en/laws-and-regulations/resolutions-and-circulars.aspx"},
-    {"c": "Philippines", "auth": "BIR", "url": "https://www.bir.gov.ph/index.php/revenue-issuances/revenue-memorandum-circulars.html"},
-    {"c": "Kenya", "auth": "KRA", "url": "https://www.kra.go.ke/news-center/public-notices"},
-    {"c": "Nigeria", "auth": "FIRS", "url": "https://www.firs.gov.ng/press-release/"},
-    {"c": "Ghana", "auth": "GRA", "url": "https://www.gra.gov.gh/index.php/news/"},
-    {"c": "Uganda", "auth": "URA", "url": "https://ura.go.ug/en/publications/public-notices/"},
-    {"c": "Zambia", "auth": "ZRA", "url": "https://www.zra.org.zm/"},
-    {"c": "Zimbabwe", "auth": "ZIMRA News", "url": "https://www.zimra.co.zw/news"},
-    {"c": "Zimbabwe", "auth": "ZIMRA Notices", "url": "https://www.zimra.co.zw/public-notices"},
-    {"c": "South Africa", "auth": "SARS", "url": "https://www.sars.gov.za/legal-counsel/interpretation-rulings/interpretation-notes/"},
-]
+# --- COUNTRY-SPECIFIC KEYWORDS ---
+KEYWORDS_BY_COUNTRY = {
+    "India": [
+        "TDS", "Form 16", "Section 192", "EPFO", "CBDT", "EPS", "EDLI", "ESI",
+        "PAN", "TAN", "Form 24Q", "Income Tax Slab", "HRA", "LTA", "Gratuity",
+        "Professional Tax", "Leave Encashment", "Cost to Company", "CTC",
+        "Dearness Allowance", "DA", "Special Allowance", "Flexible Benefit",
+        "Form 12BB", "Section 80C", "Rebate u/s 87A", "Notification", "Circular",
+        "Office Memorandum", "Press Release", "Finance Act", "TRACES", "EPFO Portal",
+        "Monthly Return", "Quarterly Return", "Form 26AS", "Aadhaar-PAN"
+    ],
+    
+    "UAE": [
+        "Corporate Tax", "Withholding Tax", "Tax Residency", "TRN", "VAT",
+        "MOHRE", "FTA", "Emiratisation", "Wage Protection System", "WPS",
+        "Housing Allowance", "Transport Allowance", "ILOE", "GPSSA", "End of Service",
+        "Gratuity", "Ministerial Resolution", "Cabinet Decision", "Federal Decree",
+        "Nafis", "SIF", "Tawteen", "EmaraTax", "UAEPASS", "Circular",
+        "Notice", "Public Clarification", "Labour Card", "Visa"
+    ],
+    
+    "Philippines": [
+        "13th Month Pay", "COLA", "Withholding Tax", "BIR Form", "Compensation Income",
+        "Holiday Pay", "Regular Holiday", "Special Non-Working Day", "Rest Day Premium",
+        "Night Shift Differential", "OT", "Overtime", "Service Incentive Leave",
+        "SSS", "PhilHealth", "Pag-IBIG", "DOLE", "Labor Advisory", "Wage Order",
+        "Revenue Memorandum Circular", "RMC", "eFPS", "Substituted Filing",
+        "Alphalist", "Establishment Report", "De Minimis", "FBT"
+    ],
+    
+    "Kenya": [
+        "PAYE", "P9 Form", "P10 Return", "NSSF", "SHIF", "Affordable Housing Levy",
+        "AHL", "Fringe Benefit Tax", "Personal Relief", "KRA", "Public Notice",
+        "iTax", "eTIMS", "Housing Benefit", "Car Benefit", "Tax Deduction Card",
+        "Deemed Interest Rate", "Non-Cash Benefits", "HELB", "RBA", "Legal Notice",
+        "Gazette Notice", "Finance Act", "TCC", "Tax Compliance Certificate",
+        "Industrial Training Levy"
+    ],
+    
+    "Nigeria": [
+        "PAYE", "NRS", "FIRS", "Personal Income Tax", "PITA", "Development Levy",
+        "Withholding Tax", "TIN", "CRA", "Benefits in Kind", "Consolidated Relief",
+        "NHF", "NHIA", "Pension Scheme", "CPS", "RSA", "PFA", "PENCOM",
+        "Information Circular", "Public Notice", "Executive Order", "Finance Act",
+        "Form H1", "Remita", "E-TCC", "LIRS", "Gratuity", "13th Month"
+    ],
+    
+    "Ghana": [
+        "PAYE", "TIN", "SSNIT", "Tier 1", "Tier 2", "GRA", "Tax Relief",
+        "Overtime Tax", "Benefits in Kind", "Chargeable Income", "Emoluments",
+        "Housing Allowance", "Transport Allowance", "COLA", "13th Month",
+        "Practice Note", "Administrative Guideline", "NPRA", "Pension Scheme",
+        "First Schedule", "Withholding Tax", "Portal", "Gazette", "Income Tax Act"
+    ],
+    
+    "Uganda": [
+        "PAYE", "TIN", "NSSF", "LST", "Local Service Tax", "URA", "EFRIS",
+        "Electronic Fiscal Receipting", "Chargeable Income", "Housing Allowance",
+        "Transport Allowance", "Gratuity", "Overtime", "URBRA", "Public Notice",
+        "General Notice", "Practice Note", "Act of Parliament", "Statutory Instrument",
+        "e-Tax", "PRN", "UKSB", "Withholding Tax", "Provisional Return"
+    ],
+    
+    "Zambia": [
+        "PAYE", "NAPSA", "NHIMA", "ZRA", "Tax Credit", "Emoluments", "Skills Development Levy",
+        "SDL", "Tax Free Threshold", "Tax Bands", "Housing Allowance", "Transport Allowance",
+        "Commutation of Leave", "Gratuity", "Practice Note", "Gazette Notice",
+        "Statutory Instrument", "Budget Speech", "TaxOnline", "Smart Invoice",
+        "TPIN", "Turnover Tax", "Personal Levy", "Occupational Pension"
+    ],
+    
+    "Zimbabwe": [
+        "PAYE", "ZIMRA", "NSSA", "AIDS Levy", "ZiG", "TaRMS", "Final Deduction System",
+        "FDS", "Business Partner Number", "BP Number", "NEC Minimum Wage", "COLA",
+        "WCIF", "ZIMDEF", "Public Notice", "Statutory Instrument", "Finance Act",
+        "ITF", "P2 Return", "Rev 5", "Collective Bargaining Agreement", "e-Services",
+        "Paynow", "Remittance", "Intermediated Money Transfer Tax"
+    ],
+    
+    "South Africa": [
+        "PAYE", "SARS", "UIF", "SDL", "IRP5", "EMP201", "Tax Directive",
+        "Fringe Benefits", "Travel Allowance", "Subsistence Allowance",
+        "Medical Scheme", "Retirement Annuity", "Provident Fund", "GEPF",
+        "Two-Pot System", "Sectoral Determination", "Regulation", "Interpretation Note",
+        "Government Gazette", "DEL", "CCMA", "Compensation Fund", "COIDA",
+        "National Minimum Wage", "Bargaining Council", "eFiling", "Garnishree"
+    ]
+}
+
+# --- OFFICIAL REPOSITORIES ---
+REPOSITORIES = {
+    "India": [
+        {"type": "Income Tax Circulars", "url": "https://incometaxindia.gov.in/pages/communications/circulars.aspx"},
+        {"type": "Income Tax Notifications", "url": "https://incometaxindia.gov.in/pages/communications/index.aspx"},
+        {"type": "EPFO Circulars", "url": "https://www.epfindia.gov.in/site_en/circulars.php"},
+        {"type": "EPFO Updates", "url": "https://www.epfindia.gov.in/site_en/Updates.php"},
+    ],
+    "UAE": [
+        {"type": "MOHRE Resolutions", "url": "https://www.mohre.gov.ae/en/laws-and-regulations/resolutions-and-circulars.aspx"},
+        {"type": "FTA Guides", "url": "https://tax.gov.ae/en/content/guides.references.aspx"},
+    ],
+    "Philippines": [
+        {"type": "DOLE Labor Advisories", "url": "https://www.dole.gov.ph/issuances/labor-advisories/"},
+        {"type": "BIR Revenue Issuances", "url": "https://www.bir.gov.ph/revenue-issuances-details"},
+    ],
+    "Kenya": [
+        {"type": "KRA Public Notices", "url": "https://www.kra.go.ke/news-center/public-notices"},
+        {"type": "KRA Publications", "url": "https://www.kra.go.ke/publications"},
+    ],
+    "Nigeria": [
+        {"type": "NRS Notices", "url": "https://www.nrs.gov.ng/"},
+    ],
+    "Ghana": [
+        {"type": "GRA Practice Notes", "url": "https://gra.gov.gh/practice-notes/"},
+        {"type": "GRA Acts & Laws", "url": "https://gra.gov.gh/acts-and-practice-notes-2/"},
+    ],
+    "Uganda": [
+        {"type": "URA Public Notices", "url": "https://www.ura.go.ug/"},
+    ],
+    "Zambia": [
+        {"type": "ZRA Practice Notes", "url": "https://www.zra.org.zm/tax-information/tax-information-details/"},
+    ],
+    "Zimbabwe": [
+        {"type": "ZIMRA Public Notices", "url": "https://www.zimra.co.zw/public-notices"},
+        {"type": "ZIMRA Downloads", "url": "https://www.zimra.co.zw/downloads/category/39-public-notices"},
+    ],
+    "South Africa": [
+        {"type": "SARS Public Notices", "url": "https://www.sars.gov.za/legal-counsel/secondary-legislation/public-notices/"},
+        {"type": "SARS Interpretation Notes", "url": "https://www.sars.gov.za/legal-counsel/legal-documents/interpretation-notes/"},
+        {"type": "Dept Labour Acts", "url": "https://www.labour.gov.za/DocumentCenter/Pages/Acts.aspx"},
+    ],
+}
+
+def is_payroll_relevant(country, title, content=""):
+    """Check if document is relevant using country-specific keywords"""
+    combined = (title + " " + content).lower()
+    keywords = KEYWORDS_BY_COUNTRY.get(country, [])
+    match_count = sum(1 for kw in keywords if kw.lower() in combined)
+    return match_count >= 1
 
 # --- MAIN SCAN ---
 def run_full_scan():
     print("🚀 DRAGNET SCAN STARTING...\n")
-    send_telegram("🚀 *DRAGNET Scan Started*\n_Scanning all countries for payroll notifications..._")
+    print("⏱️  This scan will take 5-10 minutes due to international site delays\n")
+    send_telegram("🚀 *DRAGNET Scan Started*\n_Using country-specific payroll keywords..._\n⏱️ Estimated time: 5-10 minutes")
     
+    scan_start = datetime.now()
     conn = init_database()
     session = create_session()
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     
     total_found = 0
-    total_sent = 0
+    country_reports = {}
     
-    for target in TARGETS:
-        country = target['c']
-        url = target['url']
-        print(f"\n📍 Scanning {country} ({target['auth']})...")
-        
-        try:
-            candidates = get_all_pages(session, url, headers, max_pages=2)
-            print(f"   Found {len(candidates)} links")
-            
-            if not candidates:
-                continue
-            
+    try:
+        for idx, (country, sources) in enumerate(REPOSITORIES.items(), 1):
+            print(f"\n[{idx}/10] 📍 {country}...")
             country_findings = []
             
-            for idx, item in enumerate(candidates[:10]):
-                if is_already_sent(conn, item['url']):
+            for source in sources:
+                source_type = source["type"]
+                url = source["url"]
+                
+                print(f"   📄 {source_type}...")
+                
+                try:
+                    links = extract_links_from_page(session, url, headers, timeout=15, retries=3)
+                    print(f"      Extracted {len(links)} documents")
+                    
+                    for item in links[:20]:
+                        if is_already_sent(conn, item['url']):
+                            continue
+                        
+                        title = item['title']
+                        
+                        if is_payroll_relevant(country, title):
+                            if save_notification(conn, country, title, item['url'], source_type):
+                                mark_as_sent(conn, item['url'])
+                                country_findings.append({
+                                    'title': title,
+                                    'url': item['url'],
+                                    'source': source_type
+                                })
+                                total_found += 1
+                                print(f"      ✅ PAYROLL: {title[:50]}")
+                                time.sleep(1)
+                    
+                except Exception as e:
+                    print(f"      ⚠️ Error: {str(e)[:60]}")
                     continue
                 
-                print(f"   [{idx+1}] Checking: {item['title'][:40]}...")
-                
-                content = get_content_from_url(session, item['url'], timeout=8)
-                if not content:
-                    continue
-                
-                analysis = analyze_with_ai(item['title'], content, country)
-                
-                if analysis['relevant']:
-                    if save_notification(conn, country, item['title'], item['url'], analysis['effective_date'], target['auth'], impact_data=analysis):
-                        mark_as_sent(conn, item['url'])
-                        country_findings.append({
-                            'title': item['title'],
-                            'url': item['url'],
-                            'impact_type': analysis.get('impact_type', 'Payroll'),
-                            'change_details': analysis.get('change_details', 'N/A'),
-                            'effective_date': analysis.get('effective_date', 'UNKNOWN'),
-                            'action_required': analysis.get('action_required', 'Review document')
-                        })
-                        total_found += 1
-                        print(f"      ✅ FOUND: {analysis.get('impact_type', 'Update')}")
-                        time.sleep(1)
+                time.sleep(2)
             
             if country_findings:
-                report = f"🌍 *{country}* - {len(country_findings)} CRITICAL Update(s)\n\n"
-                for finding in country_findings:
-                    report += f"*[{finding.get('impact_type', 'Payroll')}]* {finding['title']}\n"
-                    report += f"📋 *Change Details:*\n{finding.get('change_details', 'N/A')}\n\n"
-                    report += f"📅 *Effective Date:* {finding.get('effective_date', 'UNKNOWN')}\n"
-                    report += f"⚡ *Action Required:*\n{finding.get('action_required', 'Review document')}\n"
-                    report += f"🔗 [View Document]({finding['url']})\n"
-                    report += "---\n"
-                send_telegram(report)
-                total_sent += len(country_findings)
+                country_reports[country] = country_findings
+            
+            time.sleep(3)
+    
+    except Exception as e:
+        print(f"\n❌ Scan error: {e}")
+        send_telegram(f"❌ *Scan Error*: {str(e)[:100]}")
+    
+    finally:
+        # ALWAYS send results even if incomplete
+        print("\n📤 Sending results to Telegram...\n")
         
-        except Exception as e:
-            print(f"❌ Error {country}: {e}")
-    
-    summary = f"✅ *SCAN COMPLETE*\n📊 Found: *{total_found}*\n📤 Sent: *{total_sent}*"
-    send_telegram(summary)
-    print("\n" + summary)
-    
-    conn.close()
+        if country_reports:
+            for country, findings in country_reports.items():
+                report = f"🌍 *{country.upper()}* - {len(findings)} Document(s)\n\n"
+                for finding in findings:
+                    report += f"📋 *{finding['source']}*\n"
+                    report += f"{finding['title'][:70]}\n"
+                    report += f"[Open]({finding['url']})\n\n"
+                send_telegram(report)
+                time.sleep(1)
+        else:
+            send_telegram("⚠️ *No payroll documents found this scan*\n(Common for newly released documents)")
+        
+        scan_time = (datetime.now() - scan_start).total_seconds() / 60
+        summary = f"""✅ *DRAGNET SCAN COMPLETE*
+
+📊 *Results*:
+• Documents Found: *{total_found}*
+• Countries Scanned: *{len(REPOSITORIES)}*
+• Scan Duration: *{scan_time:.1f} minutes*
+• Completed: *{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*
+
+🔔 Next scan: Daily at 6 AM UTC
+"""
+        send_telegram(summary)
+        print(summary)
+        
+        conn.close()
 
 if __name__ == "__main__":
     run_full_scan()
