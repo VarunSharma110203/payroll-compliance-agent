@@ -87,6 +87,7 @@ REPOSITORIES = {
     ],
     "Nigeria": [
         "https://www.firs.gov.ng/press-release/"
+        "https://www.nrs.gov.ng/media--updates/press-releases"
         # NRS portal would be added here once stable URL is confirmed
     ],
     "Ghana": [
