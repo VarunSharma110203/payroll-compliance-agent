@@ -1,191 +1,240 @@
 import requests
 from bs4 import BeautifulSoup
-import google.generativeai as genai
 import os
 import time
-import io
+import sqlite3
 import urllib3
-from pypdf import PdfReader
+from datetime import datetime
+from urllib.parse import urljoin
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# --- CONFIGURATION ---
+# --- 0. CONFIGURATION & SAFETY ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
-    GENAI_API_KEY = os.environ["GEMINI_KEY"]
     TELEGRAM_TOKEN = os.environ["AUDIT_BOT_TOKEN"]
     TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 except KeyError:
-    print("❌ ERROR: Keys not found!")
+    print("❌ ERROR: Keys not found! Check GitHub Secrets.")
     exit(1)
 
-genai.configure(api_key=GENAI_API_KEY)
-model = genai.GenerativeModel('gemini-pro')
+# --- 1. THE "BRAIN": KEYWORDS & SOURCES ---
+# Derived from "The Digital Sovereignty of Payroll (2025-2026)"
 
-# --- TARGETS ---
-TARGETS = [
-    # 🇿🇼 ZIMBABWE (Explicit Focus on FDS/Fiscal)
-    {"c": "Zimbabwe", "auth": "ZIMRA Public Notices", "url": "https://www.zimra.co.zw/public-notices"},
+KEYWORDS = {
+    "India": [
+        "tds", "form 16", "section 192", "epfo", "cbdt", "form 24q", "finance act", 
+        "circular no", "notification", "da", "dearness allowance", "section 80c", 
+        "section 115bac", "rebate", "standard deduction"
+    ],
+    "UAE": [
+        "mohre", "wps", "wage protection", "corporate tax", "fta", "iloe", "gpssa", 
+        "involuntary loss", "decree-law", "cabinet decision", "ministerial resolution", 
+        "emiratisation", "nafis", "tax residency"
+    ],
+    "Philippines": [
+        "bir", "revenue memorandum", "rmc", "labor advisory", "dole", "13th month", 
+        "holiday pay", "withholding tax", "philhealth", "pag-ibig", "sss", "night shift", 
+        "department order", "wage order"
+    ],
+    "Kenya": [
+        "paye", "kra", "public notice", "finance act", "housing levy", "shif", "nssf", 
+        "fringe benefit", "tax deduction card", "etims", "p9 form", "legal notice"
+    ],
+    "Nigeria": [
+        "paye", "firs", "nrs", "finance act", "tax slab", "consolidated relief", 
+        "rent relief", "pencom", "nsitf", "information circular", "development levy", 
+        "wht", "gross income"
+    ],
+    "Ghana": [
+        "gra", "paye", "practice note", "ssnit", "tier 1", "tier 2", "tax relief", 
+        "overtime tax", "bonus tax", "income tax amendment", "administrative guideline"
+    ],
+    "Uganda": [
+        "ura", "paye", "public notice", "lst", "local service tax", "nssf", "efris", 
+        "tax amendment", "return dt-2008", "exempt income"
+    ],
+    "Zambia": [
+        "zra", "paye", "practice note", "tax band", "napsa", "nhima", "skills development", 
+        "sdl", "statutory instrument", "smart invoice"
+    ],
+    "Zimbabwe": [
+        "zimra", "public notice", "paye", "tax table", "nssa", "zig", "non-fds", 
+        "final deduction", "tarms", "finance act", "aids levy", "fiscal"
+    ],
+    "South Africa": [
+        "sars", "paye", "gazette", "interpretation note", "tax tables", "medical tax credit", 
+        "uif", "sdl", "eti", "two-pot", "regulation 28", "budget speech"
+    ]
+}
+
+REPOSITORIES = {
+    "India": [
+        "https://incometaxindia.gov.in/pages/communications/circulars.aspx",
+        "https://www.epfindia.gov.in/site_en/Circulars.php"
+    ],
+    "UAE": [
+        "https://www.mohre.gov.ae/en/laws-and-regulations/resolutions-and-circulars.aspx",
+        "https://tax.gov.ae/en/content/guides.references.aspx"
+    ],
+    "Philippines": [
+        "https://www.bir.gov.ph/index.php/revenue-issuances/revenue-memorandum-circulars.html",
+        "https://www.dole.gov.ph/issuances/labor-advisories/"
+    ],
+    "Kenya": [
+        "https://www.kra.go.ke/news-center/public-notices"
+    ],
+    "Nigeria": [
+        "https://www.firs.gov.ng/press-release/"
+        # NRS portal would be added here once stable URL is confirmed
+    ],
+    "Ghana": [
+        "https://gra.gov.gh/practice-notes/"
+    ],
+    "Uganda": [
+        "https://www.ura.go.ug/" # Main portal (scraper looks for notices)
+    ],
+    "Zambia": [
+        "https://www.zra.org.zm/tax-information/tax-information-details/" # Practice Notes tab
+    ],
+    "Zimbabwe": [
+        "https://www.zimra.co.zw/public-notices",
+        "https://www.zimra.co.zw/news"
+    ],
+    "South Africa": [
+        "https://www.sars.gov.za/legal-counsel/legal-documents/interpretation-notes/"
+    ]
+}
+
+# --- 2. THE DATABASE (MEMORY) ---
+def init_database():
+    conn = sqlite3.connect('payroll_audit.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS audit_log (
+        url TEXT PRIMARY KEY,
+        country TEXT,
+        title TEXT,
+        found_at TEXT
+    )''')
+    conn.commit()
+    return conn
+
+def is_new_link(conn, url):
+    c = conn.cursor()
+    c.execute('SELECT 1 FROM audit_log WHERE url = ?', (url,))
+    return c.fetchone() is None
+
+def save_link(conn, country, title, url):
+    c = conn.cursor()
+    try:
+        c.execute('INSERT INTO audit_log VALUES (?, ?, ?, ?)', 
+                 (url, country, title, datetime.now().isoformat()))
+        conn.commit()
+    except: pass
+
+# --- 3. THE "SMART FILTER" LOGIC ---
+def is_valid_document(text, url, country):
+    text_lower = text.lower()
+    url_lower = url.lower()
     
-    # 🇳🇬 NIGERIA (Explicit Focus on Tax Slabs)
-    {"c": "Nigeria", "auth": "FIRS Press & Circulars", "url": "https://www.firs.gov.ng/press-release/"},
+    # GATE 1: THE TRASH CAN (Negative Filter)
+    garbage = [
+        "about us", "contact", "search", "login", "register", "privacy", "sitemap", 
+        "home", "read more", "click here", "terms", "policy", "strategy", "board", 
+        "ethics", "vision", "mission", "career", "tender", "auction", "faqs"
+    ]
+    if any(g in text_lower for g in garbage): return False
+
+    # GATE 2: THE OFFICIAL CHECK (Positive Filter)
+    # Must look like a document or an official announcement
+    is_file = any(ext in url_lower for ext in ['.pdf', '.doc', '.docx', '.xlsx'])
+    is_official = any(word in text_lower for word in ['circular', 'notification', 'order', 'act', 'bill', 'gazette', 'amendment', 'rules', 'regulation', 'public notice', 'press release', 'practice note', 'advisory'])
     
-    # 🌍 GLOBAL OTHERS
-    {"c": "Philippines", "auth": "BIR", "url": "https://www.bir.gov.ph/index.php/revenue-issuances/revenue-memorandum-circulars.html"},
-    {"c": "India", "auth": "Income Tax", "url": "https://incometaxindia.gov.in/pages/communications/circulars.aspx"},
-    {"c": "India", "auth": "EPFO", "url": "https://www.epfindia.gov.in/site_en/Circulars.php"},
-    {"c": "UAE", "auth": "MOHRE", "url": "https://www.mohre.gov.ae/en/laws-and-regulations/resolutions-and-circulars.aspx"},
-    {"c": "Kenya", "auth": "KRA", "url": "https://www.kra.go.ke/news-center/public-notices"},
-    {"c": "South Africa", "auth": "SARS", "url": "https://www.sars.gov.za/legal-counsel/interpretation-rulings/interpretation-notes/"},
-    {"c": "Uganda", "auth": "URA", "url": "https://ura.go.ug/en/publications/public-notices/"}
-]
+    if not (is_file or is_official):
+        return False
 
-# --- THE "KILLER" KEYWORDS ---
-# The bot will prioritize ANY link containing these words
-PRIORITY_KEYWORDS = [
-    # Universal High Value
-    "tax", "finance act", "amendment", "slab", "rate", "wage", "salary", 
-    "circular", "regulation", "bill", "gazette", "compliance", "levy", "duty", 
-    # Zimbabwe Specific
-    "fds", "fiscal", "device", "non-fds", "currency", "ziq",
-    # Nigeria Specific
-    "finance", "exemption", "relief", "deduction"
-]
+    # GATE 3: THE RELEVANCE CHECK (Country Specific)
+    # Must contain a keyword from the country's specific list
+    # OR mention the current/next fiscal year
+    country_specifics = KEYWORDS.get(country, [])
+    
+    has_keyword = any(kw in text_lower for kw in country_specifics)
+    is_recent = "2025" in text_lower or "2026" in text_lower
+    
+    return has_keyword or is_recent
 
+# --- 4. NETWORK & EXECUTION ---
 def send_telegram(message):
     if len(message) > 4000: message = message[:4000] + "..."
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True}
-    try: requests.post(url, json=payload, timeout=20)
+    try: requests.post(url, json=payload, timeout=10)
     except: pass
 
 def create_session():
     session = requests.Session()
-    retry = Retry(connect=3, backoff_factor=1)
+    retry = Retry(connect=3, backoff_factor=1, total=3)
     adapter = HTTPAdapter(max_retries=retry)
     session.mount('https://', adapter)
     return session
 
-def get_content_from_url(session, url):
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
-        r = session.get(url, headers=headers, timeout=25, verify=False) # Increased timeout
-        content_type = r.headers.get('Content-Type', '').lower()
-        
-        if 'pdf' in content_type or url.lower().endswith('.pdf'):
-            try:
-                f = io.BytesIO(r.content)
-                reader = PdfReader(f)
-                text = ""
-                # Read 3 pages to capture hidden details
-                for page in reader.pages[:3]: 
-                    text += page.extract_text() + "\n"
-                return f"PDF_TEXT: {text[:2500]}"
-            except: return "ERROR_READING_PDF"
-        else:
-            soup = BeautifulSoup(r.text, 'html.parser')
-            for s in soup(["script", "style"]): s.extract()
-            return f"WEB_TEXT: {soup.get_text()[:2500]}"
-    except Exception as e: return f"DOWNLOAD_ERROR: {str(e)}"
-
 def run_audit():
-    print("📜 Starting HUNTER Scan...")
-    send_telegram("🚨 **HUNTER MODE ACTIVATED**\n_Deep scanning 60 links/site. Hunting for 'Tax Slabs', 'FDS', 'Acts'..._")
+    print("🚀 STARTING 'DIGITAL SOVEREIGNTY' AUDIT...")
+    send_telegram("🚀 **Compliance Dragnet Started**\n_Scanning 10 Sovereign Repositories..._")
     
+    conn = init_database()
     session = create_session()
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
-    for t in TARGETS:
-        try:
-            print(f"   Scanning {t['c']}...")
-            try: r = session.get(t['url'], headers=headers, timeout=60, verify=False)
-            except: 
-                send_telegram(f"⚠️ **{t['c']}**: Site Unreachable.")
-                continue
+    total_new_docs = 0
 
-            soup = BeautifulSoup(r.text, 'html.parser')
-            links = soup.find_all('a', href=True)
+    for country, urls in REPOSITORIES.items():
+        print(f"\n🔍 Scanning {country}...")
+        findings = []
+        
+        for url in urls:
+            try:
+                # High timeout for slow govt sites
+                r = session.get(url, headers=headers, timeout=30, verify=False)
+                soup = BeautifulSoup(r.text, 'html.parser')
+                links = soup.find_all('a', href=True)
+
+                for link in links:
+                    text = link.get_text(" ", strip=True)
+                    href = link['href']
+                    
+                    # Fix Relative URLs
+                    full_url = urljoin(url, href)
+
+                    # Filter: Length > 5 chars to avoid "1", "2", "Next"
+                    if len(text) > 5:
+                        if is_valid_document(text, full_url, country):
+                            if is_new_link(conn, full_url):
+                                save_link(conn, country, text, full_url)
+                                findings.append(f"📄 [{text}]({full_url})")
+                                total_new_docs += 1
             
-            # 1. SCAN DEEP (Top 60 Links)
-            candidates = []
-            # We look at the first 60 links to catch updates buried deep
-            for link in links[:60]: 
-                text = link.get_text(" ", strip=True)
-                url = link['href']
-                
-                # Filter out junk (short text)
-                if len(text) > 4 and "javascript" not in url:
-                    # Fix URL
-                    if not url.startswith("http"):
-                        if url.startswith("/"): url = "/".join(t['url'].split("/")[:3]) + url
-                        else: url = t['url'].rsplit('/', 1)[0] + "/" + url
-                    
-                    # 2. INTELLIGENT SCORING
-                    score = 0
-                    text_lower = text.lower()
-                    
-                    # Bonus points for Keywords
-                    for word in PRIORITY_KEYWORDS:
-                        if word in text_lower:
-                            score += 10 
-                    
-                    # Zimbabwe Special: If it mentions FDS, huge boost
-                    if t['c'] == "Zimbabwe" and ("fds" in text_lower or "fiscal" in text_lower):
-                        score += 50
-                    
-                    # Keep if it has keywords OR is very recent (top 5 on page)
-                    if score > 0 or len(candidates) < 5:
-                        candidates.append({"title": text, "url": url, "score": score})
+            except Exception as e:
+                print(f"⚠️ Error accessing {url}: {e}")
 
-            # Sort by Priority (Highest score first)
-            candidates = sorted(candidates, key=lambda x: x['score'], reverse=True)
-            
-            # Read the Top 8 Highest Priority items
-            top_targets = candidates[:8]
-            
-            if not top_targets:
-                send_telegram(f"⚠️ **{t['c']}**: Scanned 60 links. No keywords found.")
-                continue
+        # Send Batch Report per Country (Only if new stuff found)
+        if findings:
+            # Limit to top 8 to avoid Telegram message size limits
+            msg = f"🌍 **{country.upper()} UPDATES**\n" + "\n".join(findings[:8])
+            send_telegram(msg)
+            print(f"   ✅ Sent {len(findings)} updates.")
+            time.sleep(2) # Pause to respect Telegram rate limits
+        else:
+            print(f"   ✓ No new updates.")
 
-            findings = []
-            for item in top_targets:
-                # 3. DEEP READ CONTENT
-                content = get_content_from_url(session, item['url'])
-                if "ERROR" in content: continue
-
-                prompt = f"""
-                Role: Senior Compliance Auditor.
-                Document: "{item['title']}"
-                Content Snippet: {content}
-                
-                Task:
-                1. Does this contain updates on **Tax Rates**, **Slabs**, **Finance Act**, **Wages**, or **ZIMRA FDS/Fiscal Devices**?
-                2. If YES, summarize the specific numbers/changes.
-                3. If it is routine/junk, reply "SKIP".
-                
-                Output: [Date/Type] [Summary]
-                """
-                
-                try:
-                    res = model.generate_content(prompt)
-                    ans = res.text.strip()
-                    if "SKIP" not in ans:
-                        findings.append(f"🔴 **PRIORITY UPDATE**\n[{item['title']}]({item['url']})\n{ans}")
-                        time.sleep(2)
-                except: pass
-
-            if findings:
-                report = f"🌍 **HUNTER RESULT: {t['c'].upper()}**\n" + "\n\n".join(findings)
-                send_telegram(report)
-                time.sleep(4)
-            else:
-                send_telegram(f"✅ **{t['c']}**: Scanned 60 links. Checked top {len(top_targets)} priority docs. No Critical Updates found.")
-
-        except Exception as e:
-            print(f"Error {t['c']}: {e}")
-
-    send_telegram("✅ **Hunter Scan Complete.**")
+    conn.close()
+    
+    final_msg = f"✅ **Audit Complete.**\nFound {total_new_docs} new critical documents."
+    if total_new_docs == 0:
+        final_msg += "\n_Repositories checked. No changes since last scan._"
+        
+    send_telegram(final_msg)
 
 if __name__ == "__main__":
     run_audit()
