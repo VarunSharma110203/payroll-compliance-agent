@@ -1,69 +1,32 @@
-def is_within_6_months(date_str):
-    """Check if date is within last 6 months"""
-    if date_str == "UNKNOWN":
-        return True  # Include if we can't determine date
-    
-    try:
-        # Try to parse date string
-        for fmt in ["%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%B %d, %Y"]:
-            try:
-                doc_date = datetime.strptime(date_str, fmt)
-                cutoff = datetime.now() - timedelta(days=180)
-                return doc_date >= cutoff
-            except:
-                continue
-        return True  # If we can't parse, include it
-    except:
-        return Truedef get_pdf_content(session, url):
-    """Extract text from PDF"""
-    try:
-        r = session.get(url, timeout=15, verify=False)
-        pdf = PdfReader(io.BytesIO(r.content))
-        text = ""
-        for page in pdf.pages[:3]:  # First 3 pages only
-            text += page.extract_text() + "\n"
-        return text[:2000]
-    except:
-        return ""
-
-def get_page_content(session, url):
-    """Extract text from web page"""
-    try:
-        r = session.get(url, timeout=10, verify=False)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        for s in soup(["script", "style"]):
-            s.extract()
-        return soup.get_text()[:2000]
-    except:
-        return ""import requests
+#!/usr/bin/env python3
+import requests
 from bs4 import BeautifulSoup
 import google.genai
 import os
 import time
 import urllib3
 import sqlite3
+import re
+import io
 from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from urllib.parse import urljoin
-import re
-import io
 from pypdf import PdfReader
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-try:
-    GEMINI_API_KEY = os.environ["GEMINI_KEY"]
-    TELEGRAM_TOKEN = os.environ["AUDIT_BOT_TOKEN"]
-    TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-except KeyError:
-    print("❌ ERROR: Keys not found!")
+GEMINI_API_KEY = os.environ.get("GEMINI_KEY")
+TELEGRAM_TOKEN = os.environ.get("AUDIT_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+if not all([GEMINI_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
+    print("ERROR: Missing environment variables")
     exit(1)
 
 client = google.genai.Client(api_key=GEMINI_API_KEY)
 
-# --- DATABASE ---
-def init_database():
+def init_db():
     conn = sqlite3.connect('payroll_notifications.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS notifications (
@@ -74,9 +37,7 @@ def init_database():
         doc_date TEXT,
         found_at TEXT,
         sent_to_telegram BOOLEAN DEFAULT 0,
-        source_type TEXT,
-        change_type TEXT,
-        keywords_matched TEXT
+        source_type TEXT
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS last_run (
         country TEXT PRIMARY KEY,
@@ -85,373 +46,257 @@ def init_database():
     conn.commit()
     return conn
 
-def get_last_run(conn, country):
-    c = conn.cursor()
-    c.execute('SELECT last_run_time FROM last_run WHERE country = ?', (country,))
-    result = c.fetchone()
-    if result:
-        return datetime.fromisoformat(result[0])
-    # FIRST RUN: Look back 6 months
-    return datetime.now() - timedelta(days=180)
-
-def update_last_run(conn, country):
-    c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO last_run (country, last_run_time) VALUES (?, ?)',
-              (country, datetime.now().isoformat()))
-    conn.commit()
-
-def is_already_sent(conn, url):
-    c = conn.cursor()
-    c.execute('SELECT id FROM notifications WHERE url = ? AND sent_to_telegram = 1', (url,))
-    return c.fetchone() is not None
-
-def save_notification(conn, country, title, url, doc_date, source_type, change_type, keywords):
-    c = conn.cursor()
+def send_telegram(msg):
+    if len(msg) > 4000:
+        msg = msg[:4000] + "\n\n_[truncated]_"
     try:
-        c.execute('''INSERT INTO notifications 
-                     (country, title, url, doc_date, found_at, source_type, change_type, keywords_matched)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (country, title, url, doc_date, datetime.now().isoformat(), source_type, change_type, keywords))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                     json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+                     timeout=10)
+    except:
+        pass
 
-def mark_as_sent(conn, url):
-    c = conn.cursor()
-    c.execute('UPDATE notifications SET sent_to_telegram = 1 WHERE url = ?', (url,))
-    conn.commit()
-
-# --- TELEGRAM ---
-def send_telegram(message):
-    if len(message) > 4000:
-        message = message[:4000] + "\n\n_[truncated]_"
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": False}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"⚠️ Telegram: {e}")
-
-# --- SESSION ---
 def create_session():
-    session = requests.Session()
-    retry = Retry(connect=2, backoff_factor=0.5, total=2)
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('https://', adapter)
-    session.mount('http://', adapter)
-    return session
+    s = requests.Session()
+    a = HTTPAdapter(max_retries=Retry(connect=2, backoff_factor=0.5))
+    s.mount('https://', a)
+    s.mount('http://', a)
+    return s
 
-# --- DATE EXTRACTION (ENHANCED FOR FILENAMES) ---
 def extract_date(text):
-    """Extract date from text or filename - looks for patterns like 'January 22, 2026' or '22012026' or '22-01-2026'"""
     patterns = [
-        r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})',  # DD/MM/YYYY or DD-MM-YYYY
+        r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})',
         r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})',
-        r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})',  # YYYY/MM/DD
-        r'_(\d{8})_',  # _DDMMYYYY_
-        r'_(\d{8})',   # _DDMMYYYY
-        r'(\d{8})',    # DDMMYYYY (8 digits)
+        r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})',
+        r'_(\d{8})',
     ]
-    
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            date_str = match.group(1) if match.lastindex >= 1 else match.group(0)
-            
-            # Convert 8-digit format to readable date
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            date_str = m.group(1) if m.lastindex >= 1 else m.group(0)
             if len(date_str) == 8 and date_str.isdigit():
                 try:
-                    dd = date_str[:2]
-                    mm = date_str[2:4]
-                    yyyy = date_str[4:8]
-                    return f"{dd}-{mm}-{yyyy}"
+                    return f"{date_str[:2]}-{date_str[2:4]}-{date_str[4:8]}"
                 except:
                     pass
-            
             return date_str
-    
     return "UNKNOWN"
 
-# --- CHANGE DETECTION ---
-CHANGE_KEYWORDS = {
-    "India": {
-        "rate_change": ["tax slab", "pf rate", "esi rate", "tds", "deduction", "contribution rate", "amended", "revised"],
-        "effective_date": ["effective from", "effective date", "w.e.f", "from", "implementation date", "1st", "january", "april"],
-        "circular_type": ["circular", "notification", "office memorandum", "om", "finance act"]
-    },
-    "UAE": {
-        "rate_change": ["corporate tax", "emiratisation", "wage protection", "withholding", "gratuity", "amended", "revised"],
-        "effective_date": ["effective", "implementation", "from date", "applicable from"],
-        "circular_type": ["resolution", "cabinet decision", "ministerial", "federal decree", "circular"]
-    },
-    "Philippines": {
-        "rate_change": ["minimum wage", "13th month", "holiday pay", "premium", "ot rate", "ssa", "philhealth", "amended"],
-        "effective_date": ["effective", "effective date", "applicable", "january", "may", "april"],
-        "circular_type": ["labor advisory", "rmc", "wage order", "department order"]
-    },
-    "Kenya": {
-        "rate_change": ["paye", "nssf", "fringe benefit", "affordable housing", "tax rate", "amended", "changed"],
-        "effective_date": ["effective", "applicable", "from", "january", "quarter"],
-        "circular_type": ["public notice", "legal notice", "practice note", "gazette"]
-    },
-    "Nigeria": {
-        "rate_change": ["paye", "withholding tax", "minimum wage", "tax slab", "pensions", "nrs", "amended", "effective"],
-        "effective_date": ["effective", "implementation", "from date", "january", "2026"],
-        "circular_type": ["information circular", "public notice", "directive", "finance act"]
-    },
-    "Ghana": {
-        "rate_change": ["paye", "ssnit", "tax rate", "overtime", "amended", "revised"],
-        "effective_date": ["effective", "applicable", "from date"],
-        "circular_type": ["practice note", "gazette notice", "administrative guideline"]
-    },
-    "Uganda": {
-        "rate_change": ["paye", "nssf", "lst", "withholding", "amended", "effective"],
-        "effective_date": ["effective", "implementation", "from"],
-        "circular_type": ["public notice", "general notice", "practice note"]
-    },
-    "Zambia": {
-        "rate_change": ["paye", "napsa", "tax band", "amended", "revised"],
-        "effective_date": ["effective", "applicable", "from"],
-        "circular_type": ["practice note", "gazette notice", "statutory instrument"]
-    },
-    "Zimbabwe": {
-        "rate_change": ["paye", "nssa", "aids levy", "fds", "minimum wage", "amended"],
-        "effective_date": ["effective", "implementation", "from"],
-        "circular_type": ["public notice", "statutory instrument", "finance act"]
-    },
-    "South Africa": {
-        "rate_change": ["paye", "uif", "sdl", "minimum wage", "sectoral determination", "amended"],
-        "effective_date": ["effective", "applicable", "from date"],
-        "circular_type": ["interpretation note", "regulation", "gazette"]
-    }
-}
+def is_within_6months(date_str):
+    if date_str == "UNKNOWN":
+        return True
+    try:
+        for fmt in ["%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%B %d, %Y"]:
+            try:
+                d = datetime.strptime(date_str, fmt)
+                cutoff = datetime.now() - timedelta(days=180)
+                return d >= cutoff
+            except:
+                continue
+        return True
+    except:
+        return True
+
+def get_pdf_content(session, url):
+    try:
+        r = session.get(url, timeout=15, verify=False)
+        pdf = PdfReader(io.BytesIO(r.content))
+        text = ""
+        for page in pdf.pages[:3]:
+            text += page.extract_text() + "\n"
+        return text[:2000]
+    except:
+        return ""
+
+def get_page_content(session, url):
+    try:
+        r = session.get(url, timeout=10, verify=False)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        for s in soup(["script", "style"]):
+            s.extract()
+        return soup.get_text()[:2000]
+    except:
+        return ""
 
 def detect_change(country, title, content=""):
-    """Detect if document is a POLICY CHANGE using AI + keywords"""
+    keywords = {
+        "India": ["circular", "notification", "tds", "pf", "epfo", "tax slab", "amended", "effective"],
+        "UAE": ["resolution", "circular", "emiratisation", "corporate tax", "gratuity", "amended"],
+        "Philippines": ["labor advisory", "rmc", "13th month", "minimum wage", "holiday pay", "amended"],
+        "Kenya": ["public notice", "paye", "nssf", "tax", "amended", "effective"],
+        "Nigeria": ["circular", "notice", "paye", "tax slab", "minimum wage", "amended"],
+        "Ghana": ["practice note", "paye", "ssnit", "amended", "effective"],
+        "Uganda": ["notice", "paye", "nssf", "amended", "effective"],
+        "Zambia": ["practice note", "paye", "napsa", "amended", "effective"],
+        "Zimbabwe": ["notice", "paye", "nssa", "amended", "effective"],
+        "South Africa": ["interpretation note", "paye", "uif", "amended", "effective"],
+    }
+    
     combined = (title + " " + content).lower()
+    kws = keywords.get(country, [])
     
-    if country not in CHANGE_KEYWORDS:
+    if not any(k in combined for k in kws):
         return None, []
     
-    keywords = CHANGE_KEYWORDS[country]
-    
-    # Quick check: must be official document type
-    is_circular = any(kw in combined for kw in keywords["circular_type"])
-    if not is_circular:
-        return None, []
-    
-    # Quick check: must mention change/rate/amendment
-    has_change_keyword = any(kw in combined for kw in keywords["rate_change"])
-    if not has_change_keyword:
-        return None, []
-    
-    # If we have content and it's substantial, use AI for deeper analysis
     if len(content) > 100:
         try:
-            prompt = f"""Analyze this government payroll document and answer ONLY:
-1. Is this a POLICY CHANGE (tax rate, minimum wage, contribution, penalty, etc.)? YES or NO
-2. What specifically changed? (max 1 line)
-3. Extract effective date if mentioned
-
-Document:
-Country: {country}
+            prompt = f"""Is this a payroll POLICY CHANGE (rate, tax, wage, contribution change)? YES or NO only.
 Title: {title}
-Content: {content[:1000]}
-
-Format response as:
-POLICY_CHANGE: [YES/NO]
-CHANGE_SUMMARY: [what changed]
-EFFECTIVE_DATE: [date or UNKNOWN]"""
-            
-            response = client.models.generate_content(
-                model="models/gemini-2.0-flash",
-                contents=prompt
-            )
-            
-            ans = response.text.strip()
-            if "POLICY_CHANGE: YES" in ans:
-                # Extract effective date from AI response
-                date_match = re.search(r'EFFECTIVE_DATE:\s*(.+?)(?:\n|$)', ans)
-                effective_date = date_match.group(1).strip() if date_match else "UNKNOWN"
-                return "POLICY_CHANGE", [effective_date]
-        
-        except Exception as e:
-            print(f"      ⚠️ AI error: {str(e)[:40]}")
+Content: {content[:500]}"""
+            resp = client.models.generate_content(model="models/gemini-2.0-flash", contents=prompt)
+            if "YES" in resp.text.upper():
+                return "CHANGE", [k for k in kws if k in combined]
+        except:
+            pass
     
-    # Fallback to keyword matching
-    matched_changes = [kw for kw in keywords["rate_change"] if kw in combined]
-    return "POLICY_CHANGE" if matched_changes else None, matched_changes
+    matched = [k for k in kws if k in combined]
+    return ("CHANGE" if matched else None, matched)
 
-# --- FETCH WITH RETRY ---
-def fetch_links(session, url, headers, retries=3):
-    for attempt in range(retries):
-        try:
-            r = session.get(url, headers=headers, timeout=15, verify=False)
-            soup = BeautifulSoup(r.text, 'html.parser')
-            links = soup.find_all('a', href=True)
-            
-            candidates = []
-            for link in links:
-                text = link.get_text(" ", strip=True)
-                href = link['href']
-                
-                if len(text) > 3 and "javascript" not in href.lower():
-                    full_url = urljoin(url, href)
-                    candidates.append({"title": text, "url": full_url})
-            
-            if candidates:
-                return candidates
-            
-        except Exception as e:
-            if attempt < retries - 1:
-                time.sleep(5 * (attempt + 1))
-    
-    return []
+def fetch_links(session, url, headers):
+    try:
+        r = session.get(url, headers=headers, timeout=15, verify=False)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        links = soup.find_all('a', href=True)
+        candidates = []
+        for link in links:
+            text = link.get_text(" ", strip=True)
+            href = link['href']
+            if len(text) > 3 and "javascript" not in href.lower():
+                full_url = urljoin(url, href)
+                candidates.append({"title": text, "url": full_url})
+        return candidates
+    except:
+        return []
 
-# --- REPOSITORIES (FOCUS ON CIRCULARS/NOTICES ONLY) ---
-REPOSITORIES = {
+REPOS = {
     "India": [
         {"type": "Income Tax Circulars", "url": "https://incometaxindia.gov.in/pages/communications/circulars.aspx"},
         {"type": "EPFO Circulars", "url": "https://www.epfindia.gov.in/site_en/circulars.php"},
     ],
     "UAE": [
-        {"type": "MOHRE Resolutions", "url": "https://www.mohre.gov.ae/en/laws-and-regulations/resolutions-and-circulars.aspx"},
+        {"type": "MOHRE", "url": "https://www.mohre.gov.ae/en/laws-and-regulations/resolutions-and-circulars.aspx"},
     ],
     "Philippines": [
-        {"type": "DOLE Labor Advisories", "url": "https://www.dole.gov.ph/issuances/labor-advisories/"},
-        {"type": "BIR RMC", "url": "https://www.bir.gov.ph/revenue-issuances-details"},
+        {"type": "DOLE", "url": "https://www.dole.gov.ph/issuances/labor-advisories/"},
+        {"type": "BIR", "url": "https://www.bir.gov.ph/revenue-issuances-details"},
     ],
     "Kenya": [
-        {"type": "KRA Public Notices", "url": "https://www.kra.go.ke/news-center/public-notices"},
+        {"type": "KRA", "url": "https://www.kra.go.ke/news-center/public-notices"},
     ],
     "Nigeria": [
-        {"type": "NRS Circulars", "url": "https://www.nrs.gov.ng/"},
+        {"type": "NRS", "url": "https://www.nrs.gov.ng/"},
     ],
     "Ghana": [
-        {"type": "GRA Practice Notes", "url": "https://gra.gov.gh/practice-notes/"},
+        {"type": "GRA", "url": "https://gra.gov.gh/practice-notes/"},
     ],
     "Uganda": [
-        {"type": "URA Public Notices", "url": "https://www.ura.go.ug/"},
+        {"type": "URA", "url": "https://www.ura.go.ug/"},
     ],
     "Zambia": [
-        {"type": "ZRA Practice Notes", "url": "https://www.zra.org.zm/tax-information/tax-information-details/"},
+        {"type": "ZRA", "url": "https://www.zra.org.zm/tax-information/tax-information-details/"},
     ],
     "Zimbabwe": [
-        {"type": "ZIMRA Public Notices", "url": "https://www.zimra.co.zw/public-notices"},
+        {"type": "ZIMRA", "url": "https://www.zimra.co.zw/public-notices"},
     ],
     "South Africa": [
-        {"type": "SARS Interpretation Notes", "url": "https://www.sars.gov.za/legal-counsel/legal-documents/interpretation-notes/"},
-        {"type": "Dept Labour", "url": "https://www.labour.gov.za/DocumentCenter/Pages/Acts.aspx"},
+        {"type": "SARS", "url": "https://www.sars.gov.za/legal-counsel/legal-documents/interpretation-notes/"},
     ],
 }
 
-# --- MAIN SCAN ---
-def run_full_scan():
-    print("🚀 DRAGNET SCAN STARTING...\n")
-    print("📅 Scanning for policy changes from LAST 6 MONTHS\n")
-    send_telegram("🚀 *DRAGNET SCAN INITIATED*\n_Scanning last 6 months for policy changes..._\n⏱️ This may take 10-15 minutes")
+def main():
+    print("🚀 DRAGNET: Scanning last 6 months for policy changes\n")
+    send_telegram("🚀 DRAGNET SCAN START\nScanning last 6 months...\n⏱️ 10-15 minutes")
     
-    conn = init_database()
+    conn = init_db()
     session = create_session()
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0'}
     
-    total_found = 0
-    country_reports = {}
+    total = 0
+    reports = {}
     
-    for idx, (country, sources) in enumerate(REPOSITORIES.items(), 1):
-        print(f"\n[{idx}/10] 📍 {country}...")
-        country_findings = []
-        last_run = get_last_run(conn, country)
+    for idx, (country, sources) in enumerate(REPOS.items(), 1):
+        print(f"[{idx}/10] {country}...")
+        findings = []
         
-        for source in sources:
-            print(f"   📄 {source['type']}...")
-            
+        for src in sources:
+            print(f"  {src['type']}...")
             try:
-                links = fetch_links(session, source['url'], headers)
+                links = fetch_links(session, src['url'], headers)
                 
-                for item in links[:30]:
-                    if is_already_sent(conn, item['url']):
-                        continue
-                    
-                    title = item['title']
+                for item in links[:25]:
                     url = item['url']
+                    title = item['title']
                     is_pdf = url.lower().endswith('.pdf')
                     
-                    # Extract content from PDF or page
-                    print(f"      📥 Reading: {title[:50]}...")
+                    c = conn.cursor()
+                    c.execute('SELECT id FROM notifications WHERE url = ? AND sent_to_telegram = 1', (url,))
+                    if c.fetchone():
+                        continue
+                    
+                    print(f"    Reading: {title[:40]}...")
                     content = get_pdf_content(session, url) if is_pdf else get_page_content(session, url)
                     
-                    # Detect policy changes (with AI analysis of content)
-                    change_type, matched_keywords = detect_change(country, title, content)
+                    change_type, matched = detect_change(country, title, content)
                     
                     if change_type:
-                        doc_date = extract_date(url) if is_pdf else extract_date(title)
+                        date = extract_date(url) if is_pdf else extract_date(title)
                         
-                        # FILTER: Only include if from last 6 months
-                        if not is_within_6_months(doc_date):
+                        if not is_within_6months(date):
                             continue
                         
-                        keywords_str = ", ".join(matched_keywords[:5]) if matched_keywords else "Policy Change"
+                        kw_str = ", ".join(matched[:3]) if matched else "Policy Change"
                         
-                        if save_notification(conn, country, title, url, doc_date, source['type'], change_type, keywords_str):
-                            mark_as_sent(conn, url)
-                            country_findings.append({
+                        try:
+                            c.execute('''INSERT INTO notifications 
+                                        (country, title, url, doc_date, found_at, source_type, sent_to_telegram)
+                                        VALUES (?, ?, ?, ?, ?, ?, 1)''',
+                                     (country, title, url, date, datetime.now().isoformat(), src['type']))
+                            conn.commit()
+                            
+                            findings.append({
                                 'title': title,
                                 'url': url,
-                                'date': doc_date,
-                                'keywords': keywords_str,
-                                'source': source['type'],
+                                'date': date,
+                                'keywords': kw_str,
                                 'is_pdf': is_pdf
                             })
-                            total_found += 1
-                            pdf_icon = "📄" if is_pdf else "📋"
-                            print(f"      ✅ {pdf_icon} CHANGE DETECTED: {title[:55]}")
+                            total += 1
+                            icon = "📄" if is_pdf else "📋"
+                            print(f"    ✅ {icon} {title[:50]}")
                             time.sleep(1)
+                        except:
+                            pass
                 
             except Exception as e:
-                print(f"      ⚠️ {str(e)[:50]}")
+                print(f"    Error: {str(e)[:40]}")
             
             time.sleep(1)
         
-        if country_findings:
-            country_reports[country] = country_findings
+        if findings:
+            reports[country] = findings
         
-        update_last_run(conn, country)
         time.sleep(2)
     
-    # SEND REPORTS
-    print("\n📤 Sending to Telegram...\n")
+    print("\n📤 Sending results...\n")
     
-    if country_reports:
-        for country, findings in country_reports.items():
-            report = f"🚨 *{country.upper()} - POLICY CHANGES DETECTED*\n\n"
-            for finding in findings:
-                pdf_label = "📄 PDF" if finding['is_pdf'] else "📋 Notice"
-                report += f"{pdf_label}\n"
-                report += f"*{finding['title'][:75]}*\n"
-                report += f"📅 {finding['date']}\n"
-                report += f"🔑 {finding['keywords']}\n"
-                report += f"[👉 OPEN DOCUMENT]({finding['url']})\n\n"
-            send_telegram(report)
+    if reports:
+        for country, finds in reports.items():
+            msg = f"🚨 {country.upper()} - {len(finds)} CHANGES\n\n"
+            for f in finds:
+                icon = "📄" if f['is_pdf'] else "📋"
+                msg += f"{icon} {f['title'][:70]}\n"
+                msg += f"📅 {f['date']}\n"
+                msg += f"[OPEN]({f['url']})\n\n"
+            send_telegram(msg)
             time.sleep(1)
     else:
-        send_telegram("✅ No policy changes detected since last run\n(Check again tomorrow)")
+        send_telegram("✅ No policy changes found in last 6 months")
     
-    summary = f"""✅ *DRAGNET COMPLETE*
-
-📊 *Policy Changes Found*: *{total_found}*
-🌍 *Countries Scanned*: *10*
-⏱️ *Scan Time*: *{datetime.now().strftime('%H:%M:%S')}*
-
-📍 Next scan: Tomorrow 6 AM UTC
-
-*Important*: Review all flagged changes in your payroll system immediately
-"""
+    summary = f"✅ COMPLETE\n📊 Found: {total} changes\n🌍 10 countries\n⏱️ {datetime.now().strftime('%H:%M:%S')}"
     send_telegram(summary)
     print(summary)
     
     conn.close()
 
 if __name__ == "__main__":
-    run_full_scan()
+    main()
