@@ -5,76 +5,80 @@ import time
 import sqlite3
 import urllib3
 import re
+import io
+import json
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from pypdf import PdfReader # <--- NEW: Required for PDF reading
 
 # --- 0. CONFIGURATION ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# NEW: We need Gemini to read the PDFs
+GEMINI_API_KEY = os.environ.get("GEMINI_KEY")
 TELEGRAM_TOKEN = os.environ.get("AUDIT_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
-    print("❌ ERROR: Missing Telegram Keys in GitHub Secrets")
+if not all([GEMINI_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
+    print("❌ ERROR: Missing Keys! Check GitHub Secrets (GEMINI_KEY, AUDIT_BOT_TOKEN, TELEGRAM_CHAT_ID)")
     exit(1)
 
-# --- 1. THE "PLATINUM" REPOSITORY LIST ---
-# Includes Tax (Revenue), Labor (Ministry), AND Social Security (Pension/Health)
+# --- 1. THE "PLATINUM" REPOSITORY LIST (UNCHANGED) ---
 REPOSITORIES = {
     "India": [
-        "https://incometaxindia.gov.in/pages/communications/circulars.aspx",  # CBDT Circulars
-        "https://incometaxindia.gov.in/pages/communications/notifications.aspx", # CBDT Notifications
-        "https://www.epfindia.gov.in/site_en/Circulars.php", # EPFO (Provident Fund)
-        "https://www.epfindia.gov.in/site_en/Office_Use_Circulars.php", # EPFO Internal
-        "https://www.esic.gov.in/circulars" # ESIC (Social Insurance)
+        "https://incometaxindia.gov.in/pages/communications/circulars.aspx",
+        "https://incometaxindia.gov.in/pages/communications/notifications.aspx",
+        "https://www.epfindia.gov.in/site_en/Circulars.php",
+        "https://www.epfindia.gov.in/site_en/Office_Use_Circulars.php",
+        "https://www.esic.gov.in/circulars"
     ],
     "UAE": [
-        "https://www.mohre.gov.ae/en/laws-and-regulations/resolutions-and-circulars.aspx", # MOHRE (Labor)
-        "https://tax.gov.ae/en/content/guides.references.aspx" # FTA (Corporate Tax)
+        "https://www.mohre.gov.ae/en/laws-and-regulations/resolutions-and-circulars.aspx",
+        "https://tax.gov.ae/en/content/guides.references.aspx"
     ],
     "Philippines": [
-        "https://www.bir.gov.ph/index.php/revenue-issuances/revenue-memorandum-circulars.html", # BIR (Tax)
-        "https://www.dole.gov.ph/issuances/labor-advisories/", # DOLE (Labor)
-        "https://www.sss.gov.ph/sss/appmanager/viewArticle.jsp?page=circulars", # SSS (Social Security)
-        "https://www.philhealth.gov.ph/circulars/", # PhilHealth
-        "https://www.pagibigfund.gov.ph/circulars.html" # Pag-IBIG
+        "https://www.bir.gov.ph/index.php/revenue-issuances/revenue-memorandum-circulars.html",
+        "https://www.dole.gov.ph/issuances/labor-advisories/",
+        "https://www.sss.gov.ph/sss/appmanager/viewArticle.jsp?page=circulars",
+        "https://www.philhealth.gov.ph/circulars/",
+        "https://www.pagibigfund.gov.ph/circulars.html"
     ],
     "Kenya": [
-        "https://www.kra.go.ke/news-center/public-notices", # KRA (Tax)
-        "https://www.nssf.or.ke/tenders-and-notices", # NSSF (Pension)
-        "https://sha.go.ke/resources/circulars" # SHA/NHIF (Health)
+        "https://www.kra.go.ke/news-center/public-notices",
+        "https://www.nssf.or.ke/tenders-and-notices",
+        "https://sha.go.ke/resources/circulars"
     ],
     "Nigeria": [
-        "https://www.nrs.gov.ng/media--updates/press-releases", # NRS (New Tax)
-        "https://www.firs.gov.ng/press-release/", # FIRS (Legacy Tax)
-        "https://pencom.gov.ng/category/circulars/", # PENCOM (Pension)
-        "https://nsitf.gov.ng/news/" # NSITF (Insurance)
+        "https://www.nrs.gov.ng/media--updates/press-releases",
+        "https://www.firs.gov.ng/press-release/",
+        "https://pencom.gov.ng/category/circulars/",
+        "https://nsitf.gov.ng/news/"
     ],
     "Ghana": [
-        "https://gra.gov.gh/practice-notes/", # GRA (Tax)
-        "https://www.ssnit.org.gh/news-events/" # SSNIT (Pension)
+        "https://gra.gov.gh/practice-notes/",
+        "https://www.ssnit.org.gh/news-events/"
     ],
     "Uganda": [
-        "https://www.ura.go.ug/", # URA (Tax) - Scraped from home
-        "https://www.nssfug.org/media/news-and-notices" # NSSF (Pension)
+        "https://www.ura.go.ug/",
+        "https://www.nssfug.org/media/news-and-notices"
     ],
     "Zambia": [
-        "https://www.zra.org.zm/tax-information/tax-information-details/", # ZRA (Tax)
-        "https://www.napsa.co.zm/press-releases/" # NAPSA (Pension)
+        "https://www.zra.org.zm/tax-information/tax-information-details/",
+        "https://www.napsa.co.zm/press-releases/"
     ],
     "Zimbabwe": [
-        "https://www.zimra.co.zw/public-notices", # ZIMRA (Tax)
-        "https://www.nssa.org.zw/media-centre/press-releases/" # NSSA (Social Security) - ADDED
+        "https://www.zimra.co.zw/public-notices",
+        "https://www.nssa.org.zw/media-centre/press-releases/"
     ],
     "South Africa": [
-        "https://www.sars.gov.za/legal-counsel/secondary-legislation/public-notices/", # SARS (Tax)
-        "https://www.labour.gov.za/DocumentCenter/Pages/Acts.aspx" # Dept of Labour (UIF/Wages)
+        "https://www.sars.gov.za/legal-counsel/secondary-legislation/public-notices/",
+        "https://www.labour.gov.za/DocumentCenter/Pages/Acts.aspx"
     ]
 }
 
-# --- 2. THE KEYWORDS (EXPANDED FOR SOCIAL SECURITY) ---
+# --- 2. THE KEYWORDS (UNCHANGED - Used for Pre-Filtering) ---
 KEYWORDS = {
     "India": ["tds", "form 16", "section 192", "epfo", "cbdt", "finance act", "circular no", "notification", "da", "80c", "standard deduction", "pf rate", "esi", "esic", "gratuity", "arrears"],
     "UAE": ["mohre", "wps", "corporate tax", "fta", "iloe", "gpssa", "decree-law", "ministerial resolution", "emiratisation", "nafis", "gratuity", "pension", "contribution"],
@@ -88,7 +92,7 @@ KEYWORDS = {
     "South Africa": ["sars", "paye", "gazette", "interpretation note", "tax tables", "uif", "sdl", "eti", "two-pot", "regulation 28"]
 }
 
-# --- 3. DATABASE ---
+# --- 3. DATABASE (UNCHANGED) ---
 def init_db():
     conn = sqlite3.connect('payroll_audit_v2.db')
     c = conn.cursor()
@@ -115,54 +119,108 @@ def save(conn, country, title, url, doc_date):
         conn.commit()
     except: pass
 
-# --- 4. SMART FILTER ---
+# --- 4. NEW: UNIVERSAL CONTENT READER (Handles PDF & Web) ---
+def get_universal_content(session, url):
+    try:
+        # Stream=True allows checking headers before downloading
+        r = session.get(url, timeout=20, verify=False, stream=True)
+        content_type = r.headers.get('Content-Type', '').lower()
+        
+        # CASE A: IT IS A PDF
+        if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
+            try:
+                f = io.BytesIO(r.content)
+                reader = PdfReader(f)
+                text = ""
+                # Read first 2 pages only (saves memory/time)
+                for page in reader.pages[:2]: 
+                    text += page.extract_text() + "\n"
+                return f"PDF CONTENT: {text[:3500]}"
+            except: return "PDF_READ_ERROR"
+
+        # CASE B: IT IS A WEBPAGE
+        else:
+            # Re-request without stream for BS4
+            soup = BeautifulSoup(r.content, 'html.parser')
+            # Remove "Noise"
+            for junk in soup(["script", "style", "nav", "footer", "header", "aside"]): 
+                junk.extract()
+            text = soup.get_text(separator=' ')
+            clean_text = ' '.join(text.split())
+            return f"WEB CONTENT: {clean_text[:3500]}"
+
+    except Exception as e: 
+        return f"DOWNLOAD_ERROR: {str(e)}"
+
+# --- 5. NEW: GEMINI ANALYST ---
+def ask_gemini(text, title, country):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    headers = {'Content-Type': 'application/json'}
+    
+    prompt = f"""
+    Role: Senior Payroll Auditor for {country}.
+    Title: "{title}"
+    Content:
+    ---
+    {text}
+    ---
+    Task: Does this document contain policy updates about:
+    - Tax Rates / TDS / Withholding?
+    - Social Security / Pension / Health Contributions?
+    - Minimum Wage / Labor Law?
+    - Compliance Deadlines?
+    
+    If YES: Reply with a 1-sentence summary of the change.
+    If NO (e.g. tender, meeting, transfer, general news): Reply "SKIP".
+    """
+    
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=20)
+        if response.status_code == 200:
+            result = response.json()
+            return result['candidates'][0]['content']['parts'][0]['text'].strip()
+        return "SKIP"
+    except: return "SKIP"
+
+# --- 6. SMART FILTER (PRE-SCREENING) ---
 def is_valid_doc(text, url, country):
     text_lower = text.lower()
     url_lower = url.lower()
     
     # TRASH CAN
-    garbage = [
-        "about us", "contact", "search", "login", "register", "privacy", "sitemap", 
+    garbage = ["about us", "contact", "search", "login", "register", "privacy", "sitemap", 
         "home", "read more", "click here", "terms", "policy", "board", "ethics", 
         "career", "tender", "auction", "job", "vacancy", "opportunity",
-        "staff", "vision", "mission", "faqs", "help", "manual", "citizen", "charter"
-    ]
+        "staff", "vision", "mission", "faqs", "help", "manual", "citizen", "charter"]
     
-    # Generic headers to skip (too vague)
     if text_lower in ["notifications", "public notices", "circulars", "practice notes", "read more"]:
         return False
-    
     if any(g in text_lower for g in garbage): return False
     
     # OFFICIAL CHECK
-    # Added "guideline", "directive" for social security
     is_file = any(ext in url_lower for ext in ['.pdf', '.doc', '.docx', '.xlsx'])
     is_official = any(w in text_lower for w in ['circular', 'notification', 'order', 'act', 'bill', 'gazette', 'amendment', 'rules', 'regulation', 'public notice', 'press release', 'practice note', 'advisory', 'resolution', 'memo', 'guideline', 'directive'])
-    
     if not (is_file or is_official): return False
     
-    # RELEVANCE CHECK
+    # RELEVANCE CHECK (Keywords)
     country_kws = KEYWORDS.get(country, [])
     has_kw = any(kw in text_lower for kw in country_kws)
     is_recent = "2025" in text_lower or "2026" in text_lower
     
     return has_kw or is_recent
 
-# --- 5. UTILITIES (DATE SAFETY FIX) ---
+# --- 7. UTILITIES (DATE SAFETY) ---
 def extract_date(text):
-    patterns = [
-        r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})',
-        r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})',
-        r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})',
-        r'(\d{8})',
-    ]
+    patterns = [r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})', r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})', r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})', r'(\d{8})']
     for p in patterns:
         m = re.search(p, text, re.IGNORECASE)
         if m: return m.group(0)
-    return "UNKNOWN" # <--- Returns UNKNOWN instead of failing
+    return "UNKNOWN"
 
 def is_6months(date_str):
-    if date_str == "UNKNOWN": return True # <--- SAFETY: If no date, KEEP IT.
+    if date_str == "UNKNOWN": return True 
     try:
         for fmt in ["%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%B %d, %Y", "%d%m%Y"]:
             try:
@@ -170,18 +228,13 @@ def is_6months(date_str):
                 cutoff = datetime.now() - timedelta(days=180)
                 return d >= cutoff
             except: continue
-        return True # Default to True if date parsing is weird but not empty
+        return True 
     except: return True
 
 def send_telegram(msg):
     if len(msg) > 4000: msg = msg[:4000] + "..."
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID, 
-        "text": msg, 
-        "parse_mode": "Markdown", 
-        "disable_web_page_preview": True
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True}
     try: requests.post(url, json=payload, timeout=10)
     except: pass
 
@@ -192,9 +245,9 @@ def create_session():
     s.mount('https://', a)
     return s
 
-# --- 6. MAIN EXECUTION ---
+# --- 8. MAIN EXECUTION (UPDATED LOOP) ---
 def run_audit():
-    print("🚀 PLATINUM PAYROLL AUDIT STARTED")
+    print("🚀 PLATINUM AI PAYROLL AUDIT STARTED")
     conn = init_db()
     session = create_session()
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
@@ -228,15 +281,40 @@ def run_audit():
                     full_url = urljoin(url, href)
                     
                     if len(text) > 8: 
+                        # STEP 1: Fast Filter (Keywords & Trash Check)
                         if is_valid_doc(text, full_url, country):
                             if is_new(conn, full_url):
                                 doc_date = extract_date(text)
-                                # Logic: If date is unknown, we keep it (is_6months returns True)
+                                
+                                # STEP 2: Date Check
                                 if is_6months(doc_date):
-                                    save(conn, country, text, full_url, doc_date)
-                                    findings.append({'title': text, 'url': full_url, 'date': doc_date})
-                                    total_new += 1
-                                    print(f"   ✅ {text[:50]}...")
+                                    
+                                    # STEP 3: Deep Read (Download & AI)
+                                    print(f"   📥 Downloading: {text[:40]}...")
+                                    content = get_universal_content(session, full_url)
+                                    
+                                    if "ERROR" not in content:
+                                        print(f"   🤖 Asking AI...")
+                                        ai_analysis = ask_gemini(content, text, country)
+                                        
+                                        if "SKIP" not in ai_analysis:
+                                            # IT IS RELEVANT!
+                                            print(f"   ✅ RELEVANT: {ai_analysis[:50]}...")
+                                            save(conn, country, text, full_url, doc_date)
+                                            findings.append({
+                                                'title': text, 
+                                                'url': full_url, 
+                                                'date': doc_date,
+                                                'insight': ai_analysis
+                                            })
+                                            total_new += 1
+                                        else:
+                                            # IRRELEVANT (But mark as read)
+                                            save(conn, country, text, full_url, doc_date)
+                                    
+                                    # Sleep to protect API limits
+                                    time.sleep(1)
+
             except Exception as e:
                 print(f"   ⚠️ Error scanning {url}: {str(e)[:40]}")
             
@@ -249,16 +327,18 @@ def run_audit():
     print("\n📤 Sending reports...")
     for country, items in all_reports.items():
         msg = f"🚨 **{country.upper()} UPDATES**\n\n"
-        for item in items[:8]:
+        for item in items[:6]:
             safe_title = item['title'].replace('[', '(').replace(']', ')')
-            msg += f"📄 {safe_title}\n📅 {item['date']}\n[🔗 OPEN]({item['url']})\n\n"
+            msg += f"📄 {safe_title}\n"
+            msg += f"💡 *Insight:* {item['insight']}\n"
+            msg += f"📅 {item['date']}\n[🔗 OPEN]({item['url']})\n\n"
         send_telegram(msg)
         time.sleep(2)
     
     if total_new == 0:
         print("No new documents found.")
     else:
-        send_telegram(f"✅ **AUDIT COMPLETE**\nFound: *{total_new}* new documents.")
+        send_telegram(f"✅ **AUDIT COMPLETE**\nFound: *{total_new}* verified updates.")
     
     conn.close()
 
