@@ -6,26 +6,24 @@ import sqlite3
 import urllib3
 import re
 import io
-import json
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from pypdf import PdfReader # <--- NEW: Required for PDF reading
+from pypdf import PdfReader
 
 # --- 0. CONFIGURATION ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# NEW: We need Gemini to read the PDFs
 GEMINI_API_KEY = os.environ.get("GEMINI_KEY")
 TELEGRAM_TOKEN = os.environ.get("AUDIT_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 if not all([GEMINI_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
-    print("❌ ERROR: Missing Keys! Check GitHub Secrets (GEMINI_KEY, AUDIT_BOT_TOKEN, TELEGRAM_CHAT_ID)")
+    print("❌ ERROR: Missing Keys! Check GitHub Secrets.")
     exit(1)
 
-# --- 1. THE "PLATINUM" REPOSITORY LIST (UNCHANGED) ---
+# --- 1. REPOSITORIES ---
 REPOSITORIES = {
     "India": [
         "https://incometaxindia.gov.in/pages/communications/circulars.aspx",
@@ -78,23 +76,24 @@ REPOSITORIES = {
     ]
 }
 
-# --- 2. THE KEYWORDS (UNCHANGED - Used for Pre-Filtering) ---
+# --- 2. KEYWORDS (Pre-Filter) ---
 KEYWORDS = {
-    "India": ["tds", "form 16", "section 192", "epfo", "cbdt", "finance act", "circular no", "notification", "da", "80c", "standard deduction", "pf rate", "esi", "esic", "gratuity", "arrears"],
-    "UAE": ["mohre", "wps", "corporate tax", "fta", "iloe", "gpssa", "decree-law", "ministerial resolution", "emiratisation", "nafis", "gratuity", "pension", "contribution"],
-    "Philippines": ["bir", "revenue memorandum", "rmc", "labor advisory", "dole", "13th month", "holiday pay", "philhealth", "pag-ibig", "sss", "contribution table", "premium", "msc"],
-    "Kenya": ["paye", "kra", "public notice", "finance act", "housing levy", "shif", "nssf", "fringe benefit", "etims", "p9 form", "tier i", "tier ii"],
-    "Nigeria": ["paye", "firs", "nrs", "finance act", "tax slab", "consolidated relief", "pencom", "nsitf", "development levy", "wht", "pension reform", "contribution rate"],
-    "Ghana": ["gra", "paye", "practice note", "ssnit", "tier 1", "tier 2", "tax relief", "overtime tax", "act 896"],
-    "Uganda": ["ura", "paye", "public notice", "lst", "local service tax", "nssf", "efris", "exempt income", "cap"],
-    "Zambia": ["zra", "paye", "practice note", "tax band", "napsa", "nhima", "skills development", "sdl", "smart invoice", "ceiling"],
-    "Zimbabwe": ["zimra", "public notice", "paye", "tax table", "nssa", "zig", "non-fds", "tarms", "finance act", "aids levy", "pobs", "insurable earnings"],
-    "South Africa": ["sars", "paye", "gazette", "interpretation note", "tax tables", "uif", "sdl", "eti", "two-pot", "regulation 28"]
+    "India": ["tds", "form 16", "section 192", "epfo", "cbdt", "finance act", "circular", "notification", "da", "80c", "standard deduction", "pf rate", "esi", "esic", "gratuity", "arrears", "bill"],
+    "UAE": ["mohre", "wps", "corporate tax", "fta", "iloe", "gpssa", "decree", "resolution", "emiratisation", "nafis", "gratuity", "pension"],
+    "Philippines": ["bir", "revenue", "labor advisory", "dole", "13th month", "holiday", "philhealth", "pag-ibig", "sss", "contribution", "premium"],
+    "Kenya": ["paye", "kra", "public notice", "finance act", "housing levy", "shif", "nssf", "fringe benefit", "etims", "tier"],
+    "Nigeria": ["paye", "firs", "nrs", "finance act", "tax slab", "relief", "pencom", "nsitf", "levy", "wht", "pension"],
+    "Ghana": ["gra", "paye", "practice note", "ssnit", "tier", "tax relief", "overtime", "act"],
+    "Uganda": ["ura", "paye", "public notice", "lst", "nssf", "efris", "exempt", "cap"],
+    "Zambia": ["zra", "paye", "practice note", "tax band", "napsa", "nhima", "skills", "sdl", "smart invoice"],
+    "Zimbabwe": ["zimra", "public notice", "paye", "tax table", "nssa", "zig", "tarms", "finance act", "aids levy"],
+    "South Africa": ["sars", "paye", "gazette", "interpretation note", "tax tables", "uif", "sdl", "eti", "two-pot"]
 }
 
-# --- 3. DATABASE (UNCHANGED) ---
+# --- 3. DATABASE (V3 - NEW MEMORY) ---
 def init_db():
-    conn = sqlite3.connect('payroll_audit_v2.db')
+    # 🔴 CHANGED TO V3 TO FORCE A FRESH SCAN 🔴
+    conn = sqlite3.connect('payroll_audit_v3.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS audit_log (
         url TEXT PRIMARY KEY,
@@ -119,60 +118,71 @@ def save(conn, country, title, url, doc_date):
         conn.commit()
     except: pass
 
-# --- 4. NEW: UNIVERSAL CONTENT READER (Handles PDF & Web) ---
+# --- 4. UNIVERSAL DOWNLOADER (Safe for Images) ---
 def get_universal_content(session, url):
     try:
-        # Stream=True allows checking headers before downloading
         r = session.get(url, timeout=20, verify=False, stream=True)
         content_type = r.headers.get('Content-Type', '').lower()
         
-        # CASE A: IT IS A PDF
         if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
             try:
                 f = io.BytesIO(r.content)
                 reader = PdfReader(f)
                 text = ""
-                # Read first 2 pages only (saves memory/time)
                 for page in reader.pages[:2]: 
-                    text += page.extract_text() + "\n"
+                    extracted = page.extract_text()
+                    if extracted: text += extracted + "\n"
+                
+                # 🔴 CRITICAL CHECK: If PDF is an image, text will be empty
+                if len(text.strip()) < 50:
+                    return "EMPTY_PDF_IMAGE"
                 return f"PDF CONTENT: {text[:3500]}"
             except: return "PDF_READ_ERROR"
 
-        # CASE B: IT IS A WEBPAGE
         else:
-            # Re-request without stream for BS4
             soup = BeautifulSoup(r.content, 'html.parser')
-            # Remove "Noise"
             for junk in soup(["script", "style", "nav", "footer", "header", "aside"]): 
                 junk.extract()
             text = soup.get_text(separator=' ')
             clean_text = ' '.join(text.split())
             return f"WEB CONTENT: {clean_text[:3500]}"
 
-    except Exception as e: 
-        return f"DOWNLOAD_ERROR: {str(e)}"
+    except Exception as e: return f"DOWNLOAD_ERROR: {str(e)}"
 
-# --- 5. NEW: GEMINI ANALYST ---
+# --- 5. GEMINI JUDGE (With Title Fallback) ---
 def ask_gemini(text, title, country):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     headers = {'Content-Type': 'application/json'}
     
-    prompt = f"""
-    Role: Senior Payroll Auditor for {country}.
-    Title: "{title}"
-    Content:
-    ---
-    {text}
-    ---
-    Task: Does this document contain policy updates about:
-    - Tax Rates / TDS / Withholding?
-    - Social Security / Pension / Health Contributions?
-    - Minimum Wage / Labor Law?
-    - Compliance Deadlines?
-    
-    If YES: Reply with a 1-sentence summary of the change.
-    If NO (e.g. tender, meeting, transfer, general news): Reply "SKIP".
-    """
+    # 🔴 FALLBACK: If we couldn't read the file, ask about the TITLE
+    if text == "EMPTY_PDF_IMAGE" or "ERROR" in text:
+        prompt = f"""
+        Role: Payroll Auditor for {country}.
+        I cannot read the document content (it might be a scanned image), but here is the TITLE:
+        "{title}"
+        
+        Based on the TITLE ALONE, is this likely a policy update about:
+        - Tax / TDS / Rates?
+        - Social Security / Pension?
+        - Wages / Labor Law?
+        - Deadlines?
+        
+        If YES, reply: "YES (Title Scan): [1 sentence summary]"
+        If NO, reply: "SKIP"
+        """
+    else:
+        # Standard Full Content Check
+        prompt = f"""
+        Role: Payroll Auditor for {country}.
+        Title: "{title}"
+        Content:
+        ---
+        {text}
+        ---
+        Task: Does this contain policy updates on Tax, Payroll, Social Security, or Labor Law?
+        If YES: Reply with a 1-sentence summary.
+        If NO (tender, meeting, transfer, general news): Reply "SKIP".
+        """
     
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
@@ -184,34 +194,27 @@ def ask_gemini(text, title, country):
         return "SKIP"
     except: return "SKIP"
 
-# --- 6. SMART FILTER (PRE-SCREENING) ---
+# --- 6. EXECUTION LOGIC ---
 def is_valid_doc(text, url, country):
     text_lower = text.lower()
-    url_lower = url.lower()
-    
-    # TRASH CAN
     garbage = ["about us", "contact", "search", "login", "register", "privacy", "sitemap", 
         "home", "read more", "click here", "terms", "policy", "board", "ethics", 
         "career", "tender", "auction", "job", "vacancy", "opportunity",
-        "staff", "vision", "mission", "faqs", "help", "manual", "citizen", "charter"]
+        "staff", "vision", "mission", "faqs", "help", "manual", "citizen"]
     
-    if text_lower in ["notifications", "public notices", "circulars", "practice notes", "read more"]:
-        return False
+    if text_lower in ["notifications", "public notices", "circulars", "practice notes"]: return False
     if any(g in text_lower for g in garbage): return False
     
-    # OFFICIAL CHECK
-    is_file = any(ext in url_lower for ext in ['.pdf', '.doc', '.docx', '.xlsx'])
-    is_official = any(w in text_lower for w in ['circular', 'notification', 'order', 'act', 'bill', 'gazette', 'amendment', 'rules', 'regulation', 'public notice', 'press release', 'practice note', 'advisory', 'resolution', 'memo', 'guideline', 'directive'])
+    is_file = any(ext in url.lower() for ext in ['.pdf', '.doc', '.docx'])
+    is_official = any(w in text_lower for w in ['circular', 'notification', 'order', 'act', 'bill', 'gazette', 'amendment', 'rules', 'public notice', 'press release', 'practice note', 'advisory', 'memo'])
     if not (is_file or is_official): return False
     
-    # RELEVANCE CHECK (Keywords)
     country_kws = KEYWORDS.get(country, [])
     has_kw = any(kw in text_lower for kw in country_kws)
     is_recent = "2025" in text_lower or "2026" in text_lower
     
     return has_kw or is_recent
 
-# --- 7. UTILITIES (DATE SAFETY) ---
 def extract_date(text):
     patterns = [r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})', r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})', r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})', r'(\d{8})']
     for p in patterns:
@@ -245,9 +248,8 @@ def create_session():
     s.mount('https://', a)
     return s
 
-# --- 8. MAIN EXECUTION (UPDATED LOOP) ---
 def run_audit():
-    print("🚀 PLATINUM AI PAYROLL AUDIT STARTED")
+    print("🚀 PLATINUM AI PAYROLL AUDIT STARTED (V3)")
     conn = init_db()
     session = create_session()
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
@@ -269,7 +271,6 @@ def run_audit():
                     text = link.get_text(" ", strip=True)
                     href = link['href']
                     
-                    # INDIA JAVASCRIPT FIX
                     if "javascript:OpenWindow" in href:
                         try:
                             parts = href.split("'")
@@ -281,38 +282,35 @@ def run_audit():
                     full_url = urljoin(url, href)
                     
                     if len(text) > 8: 
-                        # STEP 1: Fast Filter (Keywords & Trash Check)
                         if is_valid_doc(text, full_url, country):
                             if is_new(conn, full_url):
                                 doc_date = extract_date(text)
-                                
-                                # STEP 2: Date Check
                                 if is_6months(doc_date):
                                     
-                                    # STEP 3: Deep Read (Download & AI)
-                                    print(f"   📥 Downloading: {text[:40]}...")
+                                    print(f"   📥 Checking: {text[:40]}...")
                                     content = get_universal_content(session, full_url)
                                     
-                                    if "ERROR" not in content:
-                                        print(f"   🤖 Asking AI...")
-                                        ai_analysis = ask_gemini(content, text, country)
-                                        
-                                        if "SKIP" not in ai_analysis:
-                                            # IT IS RELEVANT!
-                                            print(f"   ✅ RELEVANT: {ai_analysis[:50]}...")
-                                            save(conn, country, text, full_url, doc_date)
-                                            findings.append({
-                                                'title': text, 
-                                                'url': full_url, 
-                                                'date': doc_date,
-                                                'insight': ai_analysis
-                                            })
-                                            total_new += 1
-                                        else:
-                                            # IRRELEVANT (But mark as read)
-                                            save(conn, country, text, full_url, doc_date)
+                                    # 🔴 DEBUG PRINT
+                                    print(f"      Status: {content[:15]}...") 
                                     
-                                    # Sleep to protect API limits
+                                    ai_analysis = ask_gemini(content, text, country)
+                                    
+                                    # 🔴 DEBUG PRINT
+                                    print(f"      AI Says: {ai_analysis[:50]}...")
+                                    
+                                    if "SKIP" not in ai_analysis:
+                                        save(conn, country, text, full_url, doc_date)
+                                        findings.append({
+                                            'title': text, 
+                                            'url': full_url, 
+                                            'date': doc_date,
+                                            'insight': ai_analysis
+                                        })
+                                        total_new += 1
+                                    else:
+                                        # It was skipped, but save it so we don't check again
+                                        save(conn, country, text, full_url, doc_date)
+                                    
                                     time.sleep(1)
 
             except Exception as e:
@@ -323,14 +321,13 @@ def run_audit():
         if findings: all_reports[country] = findings
         time.sleep(1)
     
-    # SEND REPORTS
     print("\n📤 Sending reports...")
     for country, items in all_reports.items():
         msg = f"🚨 **{country.upper()} UPDATES**\n\n"
         for item in items[:6]:
             safe_title = item['title'].replace('[', '(').replace(']', ')')
             msg += f"📄 {safe_title}\n"
-            msg += f"💡 *Insight:* {item['insight']}\n"
+            msg += f"💡 {item['insight']}\n"
             msg += f"📅 {item['date']}\n[🔗 OPEN]({item['url']})\n\n"
         send_telegram(msg)
         time.sleep(2)
@@ -338,7 +335,7 @@ def run_audit():
     if total_new == 0:
         print("No new documents found.")
     else:
-        send_telegram(f"✅ **AUDIT COMPLETE**\nFound: *{total_new}* verified updates.")
+        send_telegram(f"✅ **AUDIT COMPLETE**\nFound: *{total_new}* updates.")
     
     conn.close()
 
