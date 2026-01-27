@@ -77,9 +77,9 @@ REPOSITORIES = {
     ]
 }
 
-# --- 2. DATABASE ---
+# --- 2. DATABASE (V5 - FRESH SCAN) ---
 def init_db():
-    conn = sqlite3.connect('payroll_audit_v3.db')
+    conn = sqlite3.connect('payroll_audit_v5.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS audit_log (
         url TEXT PRIMARY KEY,
@@ -107,26 +107,32 @@ def save(conn, country, title, url, doc_date):
 # --- 3. UNIVERSAL DOWNLOADER ---
 def get_universal_content(session, url):
     try:
+        # Stream=True allows checking headers before downloading
         r = session.get(url, timeout=20, verify=False, stream=True)
         content_type = r.headers.get('Content-Type', '').lower()
         
-        # CASE A: PDF
+        # CASE A: PDF Handling
         if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
             try:
                 f = io.BytesIO(r.content)
                 reader = PdfReader(f)
                 text = ""
+                # Read first 2 pages
                 for page in reader.pages[:2]: 
                     extracted = page.extract_text()
                     if extracted: text += extracted + "\n"
                 
-                if len(text.strip()) < 150: return "EMPTY_PDF_IMAGE"
+                # If text is extremely short (< 100 chars), treat as Image PDF
+                if len(text.strip()) < 100:
+                    return "EMPTY_PDF_IMAGE"
+                    
                 return f"PDF CONTENT: {text[:3500]}"
             except: return "PDF_READ_ERROR"
 
-        # CASE B: WEBPAGE
+        # CASE B: Webpage Handling
         else:
             soup = BeautifulSoup(r.content, 'html.parser')
+            # Clean up the HTML
             for junk in soup(["script", "style", "nav", "footer", "header", "aside"]): 
                 junk.extract()
             text = soup.get_text(separator=' ')
@@ -135,38 +141,48 @@ def get_universal_content(session, url):
 
     except Exception as e: return f"DOWNLOAD_ERROR: {str(e)}"
 
-# --- 4. GEMINI JUDGE (Aggressive) ---
+# --- 4. DYNAMIC GEMINI JUDGE ---
 def ask_gemini(text, title, country):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     headers = {'Content-Type': 'application/json'}
     
-    # Logic: If image/error, ask about Title. If text exists, ask about Text.
+    # 🔴 DYNAMIC ROUTING 🔴
+    # If the file is unreadable (Image PDF) or broken, we switch to "Title Analysis"
     if text == "EMPTY_PDF_IMAGE" or "ERROR" in text:
         prompt = f"""
-        Role: Senior Payroll Auditor for {country}.
-        I cannot read the file (scanned image). JUDGE BY TITLE ONLY: "{title}"
+        Role: Payroll Compliance Auditor for {country}.
+        I cannot read the document content (it is a scanned image).
         
-        Is this title explicitly about:
-        1. "Levy", "Tax", "VAT", "Excise", "Act", "Bill"?
-        2. "Returns", "Payments", "Due Date", "Compliance"?
-        3. "Pension", "Social Security", "Contribution", "NSSF", "NSSA"?
+        Task: Analyze the TITLE below. Based on your knowledge of payroll and tax terminology, does this title suggest a regulatory update?
         
-        If YES, reply: "YES (Title Scan): [1 sentence summary]"
-        If NO, reply: "SKIP"
+        Title: "{title}"
+        
+        Relevant Topics:
+        - Income Tax / Corporate Tax / VAT / Levies
+        - Social Security / Pension / Provident Fund
+        - Labor Law / Wages / Allowances
+        - Statutory Returns / Deadlines / Compliance
+        
+        If the title strongly implies ANY of these topics, reply YES.
+        If it looks like a tender, job vacancy, or internal meeting, reply SKIP.
+        
+        Reply Format: "YES (Title Scan): [Short Summary]" OR "SKIP"
         """
     else:
+        # If we have content, we check both Content AND Title
         prompt = f"""
-        Role: Senior Payroll Auditor for {country}.
+        Role: Payroll Compliance Auditor for {country}.
         Title: "{title}"
-        Content:
+        Content Snippet:
         ---
         {text}
         ---
-        Task: Does this document contain policy updates about:
-        - Tax Rates / TDS / Withholding?
-        - Social Security / Pension / Health Contributions?
-        - Minimum Wage / Labor Law?
-        - Compliance Deadlines?
+        
+        Task: Is this document a relevant regulatory update for Payroll, Tax, or Labor Law?
+        
+        Instructions:
+        1. Analyze the Content Snippet for rules about taxes, wages, or compliance.
+        2. CRITICAL: If the Content is vague but the TITLE is highly specific (e.g. "Finance Act", "Fringe Benefit Tax", "New Rates"), prioritize the Title and assume it is relevant.
         
         If YES: Reply with a 1-sentence summary.
         If NO (tender, meeting, transfer, general news): Reply "SKIP".
@@ -181,11 +197,11 @@ def ask_gemini(text, title, country):
         return "SKIP"
     except: return "SKIP"
 
-# --- 5. SMART FILTER (No Keywords - Just Trash Check) ---
+# --- 5. TRASH FILTER (Only removing obvious junk) ---
 def is_valid_doc(text, url):
     text_lower = text.lower()
     
-    # 1. TRASH CAN (Crucial without keywords)
+    # Only filter out pure administrative junk. Let AI decide the rest.
     garbage = ["about us", "contact", "search", "login", "register", "privacy", "sitemap", 
         "home", "read more", "click here", "terms", "policy", "board", "ethics", 
         "career", "tender", "auction", "job", "vacancy", "opportunity",
@@ -194,11 +210,10 @@ def is_valid_doc(text, url):
     if text_lower in ["notifications", "public notices", "circulars", "practice notes"]: return False
     if any(g in text_lower for g in garbage): return False
     
-    # 2. OFFICIAL CHECK
+    # If it looks like a file OR an official update, we check it.
     is_file = any(ext in url.lower() for ext in ['.pdf', '.doc', '.docx', '.xlsx'])
     is_official = any(w in text_lower for w in ['circular', 'notification', 'order', 'act', 'bill', 'gazette', 'amendment', 'rules', 'regulation', 'public notice', 'press release', 'practice note', 'advisory', 'resolution', 'memo', 'guideline', 'directive'])
     
-    # If it looks like a file OR an official update, we check it.
     return is_file or is_official
 
 # --- 6. UTILITIES ---
@@ -237,7 +252,7 @@ def create_session():
 
 # --- 7. MAIN EXECUTION ---
 def run_audit():
-    print("🚀 PLATINUM AI PAYROLL AUDIT STARTED (No Keywords)")
+    print("🚀 DYNAMIC AI PAYROLL AUDIT STARTED (V5)")
     conn = init_db()
     session = create_session()
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
@@ -269,7 +284,7 @@ def run_audit():
                     full_url = urljoin(url, href)
                     
                     if len(text) > 8: 
-                        # 🔴 NO KEYWORD CHECK - Just Trash Filter
+                        # 1. TRASH CHECK ONLY (No keywords)
                         if is_valid_doc(text, full_url):
                             if is_new(conn, full_url):
                                 doc_date = extract_date(text)
@@ -277,6 +292,8 @@ def run_audit():
                                     
                                     print(f"   📥 Checking: {text[:40]}...")
                                     content = get_universal_content(session, full_url)
+                                    
+                                    # 2. ASK GEMINI (Dynamic Judging)
                                     ai_analysis = ask_gemini(content, text, country)
                                     print(f"      AI Says: {ai_analysis[:50]}...")
                                     
