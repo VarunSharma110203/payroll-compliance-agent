@@ -6,6 +6,7 @@ import sqlite3
 import urllib3
 import re
 import io
+import json
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
 from requests.adapters import HTTPAdapter
@@ -76,23 +77,8 @@ REPOSITORIES = {
     ]
 }
 
-# --- 2. KEYWORDS (Pre-Filter) ---
-KEYWORDS = {
-    "India": ["tds", "form 16", "section 192", "epfo", "cbdt", "finance act", "circular", "notification", "da", "80c", "standard deduction", "pf rate", "esi", "esic", "gratuity", "arrears", "bill"],
-    "UAE": ["mohre", "wps", "corporate tax", "fta", "iloe", "gpssa", "decree", "resolution", "emiratisation", "nafis", "gratuity", "pension"],
-    "Philippines": ["bir", "revenue", "labor advisory", "dole", "13th month", "holiday", "philhealth", "pag-ibig", "sss", "contribution", "premium"],
-    "Kenya": ["paye", "kra", "public notice", "finance act", "housing levy", "shif", "nssf", "fringe benefit", "etims", "tier"],
-    "Nigeria": ["paye", "firs", "nrs", "finance act", "tax slab", "relief", "pencom", "nsitf", "levy", "wht", "pension"],
-    "Ghana": ["gra", "paye", "practice note", "ssnit", "tier", "tax relief", "overtime", "act"],
-    "Uganda": ["ura", "paye", "public notice", "lst", "nssf", "efris", "exempt", "cap"],
-    "Zambia": ["zra", "paye", "practice note", "tax band", "napsa", "nhima", "skills", "sdl", "smart invoice"],
-    "Zimbabwe": ["zimra", "public notice", "paye", "tax table", "nssa", "zig", "tarms", "finance act", "aids levy"],
-    "South Africa": ["sars", "paye", "gazette", "interpretation note", "tax tables", "uif", "sdl", "eti", "two-pot"]
-}
-
-# --- 3. DATABASE (V3 - NEW MEMORY) ---
+# --- 2. DATABASE ---
 def init_db():
-    # 🔴 CHANGED TO V3 TO FORCE A FRESH SCAN 🔴
     conn = sqlite3.connect('payroll_audit_v3.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS audit_log (
@@ -118,12 +104,13 @@ def save(conn, country, title, url, doc_date):
         conn.commit()
     except: pass
 
-# --- 4. UNIVERSAL DOWNLOADER (Safe for Images) ---
+# --- 3. UNIVERSAL DOWNLOADER ---
 def get_universal_content(session, url):
     try:
         r = session.get(url, timeout=20, verify=False, stream=True)
         content_type = r.headers.get('Content-Type', '').lower()
         
+        # CASE A: PDF
         if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
             try:
                 f = io.BytesIO(r.content)
@@ -133,12 +120,11 @@ def get_universal_content(session, url):
                     extracted = page.extract_text()
                     if extracted: text += extracted + "\n"
                 
-                # 🔴 CRITICAL CHECK: If PDF is an image, text will be empty
-                if len(text.strip()) < 50:
-                    return "EMPTY_PDF_IMAGE"
+                if len(text.strip()) < 150: return "EMPTY_PDF_IMAGE"
                 return f"PDF CONTENT: {text[:3500]}"
             except: return "PDF_READ_ERROR"
 
+        # CASE B: WEBPAGE
         else:
             soup = BeautifulSoup(r.content, 'html.parser')
             for junk in soup(["script", "style", "nav", "footer", "header", "aside"]): 
@@ -149,37 +135,39 @@ def get_universal_content(session, url):
 
     except Exception as e: return f"DOWNLOAD_ERROR: {str(e)}"
 
-# --- 5. GEMINI JUDGE (With Title Fallback) ---
+# --- 4. GEMINI JUDGE (Aggressive) ---
 def ask_gemini(text, title, country):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     headers = {'Content-Type': 'application/json'}
     
-    # 🔴 FALLBACK: If we couldn't read the file, ask about the TITLE
+    # Logic: If image/error, ask about Title. If text exists, ask about Text.
     if text == "EMPTY_PDF_IMAGE" or "ERROR" in text:
         prompt = f"""
-        Role: Payroll Auditor for {country}.
-        I cannot read the document content (it might be a scanned image), but here is the TITLE:
-        "{title}"
+        Role: Senior Payroll Auditor for {country}.
+        I cannot read the file (scanned image). JUDGE BY TITLE ONLY: "{title}"
         
-        Based on the TITLE ALONE, is this likely a policy update about:
-        - Tax / TDS / Rates?
-        - Social Security / Pension?
-        - Wages / Labor Law?
-        - Deadlines?
+        Is this title explicitly about:
+        1. "Levy", "Tax", "VAT", "Excise", "Act", "Bill"?
+        2. "Returns", "Payments", "Due Date", "Compliance"?
+        3. "Pension", "Social Security", "Contribution", "NSSF", "NSSA"?
         
         If YES, reply: "YES (Title Scan): [1 sentence summary]"
         If NO, reply: "SKIP"
         """
     else:
-        # Standard Full Content Check
         prompt = f"""
-        Role: Payroll Auditor for {country}.
+        Role: Senior Payroll Auditor for {country}.
         Title: "{title}"
         Content:
         ---
         {text}
         ---
-        Task: Does this contain policy updates on Tax, Payroll, Social Security, or Labor Law?
+        Task: Does this document contain policy updates about:
+        - Tax Rates / TDS / Withholding?
+        - Social Security / Pension / Health Contributions?
+        - Minimum Wage / Labor Law?
+        - Compliance Deadlines?
+        
         If YES: Reply with a 1-sentence summary.
         If NO (tender, meeting, transfer, general news): Reply "SKIP".
         """
@@ -189,14 +177,15 @@ def ask_gemini(text, title, country):
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=20)
         if response.status_code == 200:
-            result = response.json()
-            return result['candidates'][0]['content']['parts'][0]['text'].strip()
+            return response.json()['candidates'][0]['content']['parts'][0]['text'].strip()
         return "SKIP"
     except: return "SKIP"
 
-# --- 6. EXECUTION LOGIC ---
-def is_valid_doc(text, url, country):
+# --- 5. SMART FILTER (No Keywords - Just Trash Check) ---
+def is_valid_doc(text, url):
     text_lower = text.lower()
+    
+    # 1. TRASH CAN (Crucial without keywords)
     garbage = ["about us", "contact", "search", "login", "register", "privacy", "sitemap", 
         "home", "read more", "click here", "terms", "policy", "board", "ethics", 
         "career", "tender", "auction", "job", "vacancy", "opportunity",
@@ -205,16 +194,14 @@ def is_valid_doc(text, url, country):
     if text_lower in ["notifications", "public notices", "circulars", "practice notes"]: return False
     if any(g in text_lower for g in garbage): return False
     
-    is_file = any(ext in url.lower() for ext in ['.pdf', '.doc', '.docx'])
-    is_official = any(w in text_lower for w in ['circular', 'notification', 'order', 'act', 'bill', 'gazette', 'amendment', 'rules', 'public notice', 'press release', 'practice note', 'advisory', 'memo'])
-    if not (is_file or is_official): return False
+    # 2. OFFICIAL CHECK
+    is_file = any(ext in url.lower() for ext in ['.pdf', '.doc', '.docx', '.xlsx'])
+    is_official = any(w in text_lower for w in ['circular', 'notification', 'order', 'act', 'bill', 'gazette', 'amendment', 'rules', 'regulation', 'public notice', 'press release', 'practice note', 'advisory', 'resolution', 'memo', 'guideline', 'directive'])
     
-    country_kws = KEYWORDS.get(country, [])
-    has_kw = any(kw in text_lower for kw in country_kws)
-    is_recent = "2025" in text_lower or "2026" in text_lower
-    
-    return has_kw or is_recent
+    # If it looks like a file OR an official update, we check it.
+    return is_file or is_official
 
+# --- 6. UTILITIES ---
 def extract_date(text):
     patterns = [r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})', r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})', r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})', r'(\d{8})']
     for p in patterns:
@@ -248,8 +235,9 @@ def create_session():
     s.mount('https://', a)
     return s
 
+# --- 7. MAIN EXECUTION ---
 def run_audit():
-    print("🚀 PLATINUM AI PAYROLL AUDIT STARTED (V3)")
+    print("🚀 PLATINUM AI PAYROLL AUDIT STARTED (No Keywords)")
     conn = init_db()
     session = create_session()
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
@@ -276,26 +264,20 @@ def run_audit():
                             parts = href.split("'")
                             clean_path = [p for p in parts if "/" in p and "." in p]
                             if clean_path: href = clean_path[0]
-                            else: continue
                         except: continue
                     
                     full_url = urljoin(url, href)
                     
                     if len(text) > 8: 
-                        if is_valid_doc(text, full_url, country):
+                        # 🔴 NO KEYWORD CHECK - Just Trash Filter
+                        if is_valid_doc(text, full_url):
                             if is_new(conn, full_url):
                                 doc_date = extract_date(text)
                                 if is_6months(doc_date):
                                     
                                     print(f"   📥 Checking: {text[:40]}...")
                                     content = get_universal_content(session, full_url)
-                                    
-                                    # 🔴 DEBUG PRINT
-                                    print(f"      Status: {content[:15]}...") 
-                                    
                                     ai_analysis = ask_gemini(content, text, country)
-                                    
-                                    # 🔴 DEBUG PRINT
                                     print(f"      AI Says: {ai_analysis[:50]}...")
                                     
                                     if "SKIP" not in ai_analysis:
@@ -308,7 +290,6 @@ def run_audit():
                                         })
                                         total_new += 1
                                     else:
-                                        # It was skipped, but save it so we don't check again
                                         save(conn, country, text, full_url, doc_date)
                                     
                                     time.sleep(1)
