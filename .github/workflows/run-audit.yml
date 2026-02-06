@@ -1,47 +1,99 @@
-name: Payroll Compliance Audit
+name: Payroll Compliance Audit v7
 
 on:
   schedule:
     # Runs at 06:00 UTC every day
     - cron: '0 6 * * *'
-  workflow_dispatch: # Allows you to click "Run Now" manually
+    # Also run at 18:00 UTC (second scan)
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      debug_mode:
+        description: 'Enable debug logging'
+        required: false
+        default: 'false'
+        type: boolean
 
 permissions:
-  contents: write # Needed to save the database back to the repo
+  contents: write
 
 jobs:
   run_audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 30  # Kill if stuck
 
     steps:
-      - name: Checkout code
+      - name: 📥 Checkout code
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
         with:
-          python-version: '3.9'
+          fetch-depth: 1
 
-      - name: Install dependencies
-        # 🔴 UPDATE: Added pypdf for the new reader
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 urllib3 pypdf
+          pip install \
+            aiohttp \
+            beautifulsoup4 \
+            pypdf \
+            requests
 
-      - name: Run Audit Script
+      - name: 🔍 Verify secrets are set
+        run: |
+          if [ -z "${{ secrets.GEMINI_KEY }}" ]; then
+            echo "❌ GEMINI_KEY secret is not set!"
+            exit 1
+          fi
+          if [ -z "${{ secrets.AUDIT_BOT_TOKEN }}" ]; then
+            echo "❌ AUDIT_BOT_TOKEN secret is not set!"
+            exit 1
+          fi
+          if [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
+            echo "❌ TELEGRAM_CHAT_ID secret is not set!"
+            exit 1
+          fi
+          echo "✅ All secrets are configured"
+
+      - name: 🚀 Run Audit Script
         env:
-          # 🔴 UPDATE: Added GEMINI_KEY so AI works
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
           AUDIT_BOT_TOKEN: ${{ secrets.AUDIT_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python audit.py
-
-      - name: Commit and Push Database
-        # This saves the DB so the bot remembers what it sent
+          PYTHONUNBUFFERED: "1"
         run: |
-          git config --global user.name "Audit Bot"
-          git config --global user.email "bot@noreply.github.com"
-          # Force add if it exists (handles first run creation)
-          git add payroll_audit.db || true
-          # Only commit if the db actually changed
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update audit database" && git push)
+          echo "Starting Payroll Audit v7..."
+          python payroll_audit_ultimate.py
+        continue-on-error: false
+
+      - name: 💾 Commit and Push Database
+        run: |
+          git config --global user.name "Payroll Audit Bot"
+          git config --global user.email "audit-bot@noreply.github.com"
+
+          # Add database file (v7 uses payroll_audit_v7.db)
+          git add payroll_audit_v7.db 2>/dev/null || true
+          git add payroll_audit.db 2>/dev/null || true
+
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "📝 No database changes to commit"
+          else
+            git commit -m "🔄 Update audit database [$(date -u '+%Y-%m-%d %H:%M UTC')]"
+            git push
+            echo "✅ Database committed and pushed"
+          fi
+
+      - name: 📊 Upload logs as artifact (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-logs-${{ github.run_id }}
+          path: |
+            *.log
+            *.db
+          retention-days: 7
