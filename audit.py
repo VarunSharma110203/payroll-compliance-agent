@@ -62,9 +62,9 @@ except ImportError:
 
 class Config:
     """Central configuration"""
-    # API Keys (from environment)
+    # API Keys (from environment) - Updated to match GitHub secrets
     GEMINI_API_KEY = os.environ.get("GEMINI_KEY", "")
-    TELEGRAM_TOKEN = os.environ.get("AUDIT_BOT_TOKEN", "")
+    TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")  # Changed from AUDIT_BOT_TOKEN
     TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
     # Database - using old name for backward compatibility
@@ -95,7 +95,7 @@ class Config:
         if not cls.GEMINI_API_KEY:
             missing.append("GEMINI_KEY")
         if not cls.TELEGRAM_TOKEN:
-            missing.append("AUDIT_BOT_TOKEN")
+            missing.append("TELEGRAM_TOKEN")
         if not cls.TELEGRAM_CHAT_ID:
             missing.append("TELEGRAM_CHAT_ID")
 
