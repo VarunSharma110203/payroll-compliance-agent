@@ -1,11 +1,9 @@
 name: Payroll Regulatory Audit
-
 on:
   schedule:
     # Run every 6 hours
     - cron: '0 */6 * * *'
   workflow_dispatch:  # Allow manual triggering
-
 jobs:
   audit:
     runs-on: ubuntu-latest
@@ -42,7 +40,7 @@ jobs:
     
     - name: Upload database artifact
       if: always()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: audit-database
         path: payroll_audit.db
