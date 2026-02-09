@@ -360,12 +360,12 @@ class GeminiAnalyzer:
         relevant_articles = []
 
         for country, country_articles in by_country.items():
-            # Process in chunks of 10 articles per Gemini call
-            for i in range(0, len(country_articles), 10):
-                chunk = country_articles[i:i + 10]
+            # Process in chunks of 25 articles per Gemini call (fewer API calls = less rate limiting)
+            for i in range(0, len(country_articles), 25):
+                chunk = country_articles[i:i + 25]
                 result = await self._analyze_chunk(country, chunk, session)
                 relevant_articles.extend(result)
-                await asyncio.sleep(1)  # Rate limit
+                await asyncio.sleep(15)  # Respect free tier rate limits
 
         logger.info(f"Gemini analysis: {len(relevant_articles)} relevant out of {len(articles)}")
         return relevant_articles
@@ -424,14 +424,14 @@ Categories: "statutory_change", "compliance_deadline", "general_payroll"
 Only include articles where relevant=true. Omit irrelevant ones entirely.
 Be strict - only include articles about CONFIRMED changes, not speculation."""
 
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 url = f"{self.base_url}?key={self.api_key}"
                 payload = {
                     "contents": [{"parts": [{"text": prompt}]}],
                     "generationConfig": {
                         "temperature": 0.1,
-                        "maxOutputTokens": 2000,
+                        "maxOutputTokens": 4000,
                         "responseMimeType": "application/json",
                     }
                 }
@@ -445,8 +445,9 @@ Be strict - only include articles about CONFIRMED changes, not speculation."""
                         answer = result['candidates'][0]['content']['parts'][0]['text']
                         return self._parse_response(answer, articles)
                     elif response.status == 429:
-                        logger.warning(f"Gemini rate limited, retrying... (attempt {attempt + 1})")
-                        await asyncio.sleep(5 * (attempt + 1))
+                        wait_time = 30 * (attempt + 1)  # 30s, 60s, 90s, 120s, 150s
+                        logger.warning(f"Gemini rate limited, waiting {wait_time}s... (attempt {attempt + 1}/5)")
+                        await asyncio.sleep(wait_time)
                     else:
                         error_text = await response.text()
                         logger.warning(f"Gemini API error {response.status}: {error_text[:100]}")
@@ -454,9 +455,10 @@ Be strict - only include articles about CONFIRMED changes, not speculation."""
 
             except Exception as e:
                 logger.warning(f"Gemini error (attempt {attempt + 1}): {str(e)[:80]}")
-                if attempt < 2:
-                    await asyncio.sleep(3)
+                if attempt < 4:
+                    await asyncio.sleep(15)
 
+        logger.warning(f"Gemini failed after 5 attempts for {country} chunk, skipping")
         return []
 
     def _parse_response(
