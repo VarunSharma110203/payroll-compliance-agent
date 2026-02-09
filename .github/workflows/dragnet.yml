@@ -1,52 +1,54 @@
-name: 🚀 Payroll DRAGNET Scan
+name: 📰 Payroll News Monitor
 
 on:
   schedule:
-    # Daily at 6 AM UTC
-    - cron: '0 6 * * *'
-  
+    # Daily at 3:30 AM UTC = 9:00 AM IST
+    - cron: '30 3 * * *'
+
   # Manual trigger
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  dragnet-scan:
+  news-scan:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 15
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      
+          fetch-depth: 1
+
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
-      - name: Cache pip packages
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-      
+          cache: 'pip'
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 google-genai pypdf
-      
-      - name: Run DRAGNET Scan
+          pip install aiohttp
+
+      - name: Run Payroll News Monitor
         env:
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
           AUDIT_BOT_TOKEN: ${{ secrets.AUDIT_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python calude_audit.py
-      
+          PYTHONUNBUFFERED: "1"
+        run: python payroll_news_monitor.py
+
       - name: Commit database changes
         run: |
           git config --local user.email "action@github.com"
-          git config --local user.name "🚀 DRAGNET Bot"
+          git config --local user.name "📰 Payroll News Bot"
           git add payroll_notifications.db || true
-          git commit -m "🔄 DRAGNET Database Update - $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)" || true
-          git push https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git || true
+          if git diff --staged --quiet; then
+            echo "No database changes to commit"
+          else
+            git commit -m "🔄 News Monitor DB Update - $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)"
+            git push https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          fi
