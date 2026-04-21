@@ -27,7 +27,7 @@ from countries import COUNTRIES, Country
 from telegram_reporter import TelegramReporter
 
 LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "14"))
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "4"))
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "2"))
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
