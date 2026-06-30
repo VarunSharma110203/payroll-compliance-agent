@@ -53,7 +53,7 @@ Telegram Group (Payroll + Product Team)
 ```bash
 pip install -r requirements.txt
 ```
-
+LOOM: https://www.loom.com/share/e39fa898f52b4b3c9a9c681bdd616603
 Set the following as GitHub Secrets:
 - `GEMINI_API_KEY`
 - `TELEGRAM_BOT_TOKEN`
